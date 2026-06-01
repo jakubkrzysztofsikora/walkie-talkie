@@ -1,0 +1,11 @@
+project/.venv/
+project/.studio.deploy.env
+project/data/
+project/.security-reports/
+project/walkie_agent/__pycache__/
+__pycache__/
+*.pyc
+.DS_Store
+node_modules/
+tests/ui/playwright-report/
+tests/ui/test-results/
