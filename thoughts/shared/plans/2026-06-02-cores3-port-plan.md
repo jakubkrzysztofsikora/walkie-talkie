@@ -65,11 +65,13 @@ graph TD
   P1 --> P5a
   P5a --> P5b
   P3 --> P5b
+  P1 --> P5b
   P5b --> P6
   P2 --> P6
   P3 --> P6
   P7 --> P8
   P8 --> P9
+  P7 --> P9
   P2 --> P9
   P0 --> X1
   P7 --> X1
@@ -669,7 +671,7 @@ Verification before starting P10:
 
 **Estimated effort:** XL (4 days, deferred — listed for completeness; not v1 critical path)
 
-**Depends on:** P15
+**Depends on:** P15 (logical successor — picked up only after v1 ships). **Deferred from v1 critical path**, which is why the mermaid graph above does NOT draw a `P15 --> P16` edge; the effort summary counts P16 separately under "Deferred backlog".
 
 ---
 
