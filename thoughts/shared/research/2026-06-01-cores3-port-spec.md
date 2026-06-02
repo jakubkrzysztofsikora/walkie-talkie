@@ -426,6 +426,14 @@ Error codes: `auth_failed`, `agent_unavailable`, `session_start_failed`, `sessio
 }
 ```
 
+**`agent_interrupted`** — Sent when the user spoke over the agent (ElevenLabs `interrupt()` fired). The device MUST flush any buffered output PCM immediately so the user's interruption is honoured without a stale tail of TTS audio. This is the **only** interrupt signal — there is no binary sentinel (see §6.1 and §12).
+```json
+{
+  "type": "agent_interrupted",
+  "ts": 1748779207
+}
+```
+
 ### PTT Model (v1)
 
 **v1 (momentary):** Touch screen (anywhere) → `session_start`. Release touch → `session_end`. This maps directly to the existing browser PTT behaviour (the `#ptt-btn` in `index.html` uses `pointerdown`/`pointerup`). The CoreS3 FT6336U touch IC fires a finger-down event; the firmware uses a debounce of 50 ms.
@@ -472,7 +480,7 @@ There is also `AsyncAudioInterface` with the same four methods declared as `asyn
 
 - `start(input_callback)`: stores callback; called when ElevenLabs session opens.
 - `output(audio)`: Opus-encodes the PCM chunk and calls `await websocket.send_bytes(opus_packet)`. Must not block; if the WebSocket send queue is full, drop the packet and mark an interrupt (the device will hear silence, which is acceptable degradation).
-- `interrupt()`: sends a `{"type":"agent_interrupted"}` text frame to the device so the device can flush its jitter buffer. Also sends a WebSocket binary frame consisting of a special sentinel (1-byte `0xFF`) to flush the device's output queue.
+- `interrupt()`: sends a `{"type":"agent_interrupted"}` JSON text frame to the device so the device can flush its jitter buffer. **The text frame is the ONLY signal** — do NOT also send a 1-byte `0xFF` binary frame as an earlier draft of this spec did. A valid Opus packet can legally begin with `0xFF` (TOC byte for config 31, stereo, code 3), so a length-1 binary frame is indistinguishable from a malformed Opus packet. See §12 spec-gap audit entry "Sentinel byte `0xFF` collision" for the rationale.
 - `stop()`: sets an internal `_running` flag to False; no further audio calls after this.
 
 The module also contains the WebSocket endpoint handler (`cores3_session_handler`) that manages the lifetime of one CoreS3 connection: reads the `hello` handshake, dispatches binary frames to the input callback, and fires `CoreS3AudioInterface.output` for outgoing frames.
@@ -894,6 +902,24 @@ ElatoAI does not document AEC mitigation; its DevKitC reference hardware uses a 
 **v1 requirement:** The CoreS3 WebSocket endpoint authenticates via `device_token` (per-device token in NVS). This prevents any ESP32 on the same Tailscale network from connecting without a provisioned token. It does not provide multi-tenancy (multiple families on one server) — that is explicitly out of scope.
 
 **Risk level:** Low for v1 (single family, private Tailscale). Document as a limitation.
+
+---
+
+### 12.X Spec Gaps from 2026-06-02 Planning Audit
+
+Consolidated follow-up list from the planning-pass review. Each was originally surfaced as a planner note buried in a task body — re-anchored here so future readers can find them in one place.
+
+| # | Gap | Status | Fix in this revision |
+|---|-----|--------|----------------------|
+| 1 | Encoder ownership ambiguity in `CoreS3AudioInterface` (§6.1) | resolved | §6.1 clarifies: interface owns encoder, session handler owns decoder. |
+| 2 | Partial-frame handling in `output()` (§4) — zero-pad vs reject not specified | open, decision punted to implementation | Recommend **zero-pad the final short frame** with comment, since dropping causes an audible click at TTS chunk boundaries. Implementer should document the choice in `cores3_bridge.py`. |
+| 3 | `agent_interrupted` text frame was used in §6.1 but missing from §5 Server→Device enum | **resolved in this revision** | Added `agent_interrupted` to §5 control-message schemas. |
+| 4 | Sentinel byte `0xFF` collision with valid Opus TOC bytes (§6.1) | **resolved in this revision** | Binary sentinel removed; `agent_interrupted` text frame is now the only interrupt signal. §6.1 updated, §5 enum updated. |
+| 5 | `ask_expert` listed in §6.5 tools table — appears as 11th tool, not a `switch_character` value | **non-issue** | Reviewer flagged this as a possible mis-mapping. Confirmed: `ask_expert` is a tool, not a character; §6.5 is correct. No spec change. |
+| 6 | CLI invocation pattern assumes `walkie_agent/main.py` (§6.4 implicit) | open | Plan P4 hedges with `python -m walkie_agent` alternative; implementer to confirm at code time. |
+| 7 | `pio test -e native` feasibility for `arduino-libopus` (§7) | open | Plan P9 acceptance allows deferral to P10 if native test path is not viable. No spec change. |
+
+Gaps 3 and 4 are spec edits applied in this revision. Gaps 1, 5 are non-issues. Gaps 2, 6, 7 are implementation-time decisions documented in the plan.
 
 ---
 
