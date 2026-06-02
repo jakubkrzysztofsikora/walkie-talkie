@@ -1,8 +1,13 @@
 # CoreS3 Port — Phased Implementation Plan
 
-**You are reading this on:** 2026-06-02
+**You are reading this on:** 2026-06-02 (revised same day after spec↔plan review)
 **Spec:** `/Users/jakubsikora/Repos/personal/walkie-talkie/thoughts/shared/research/2026-06-01-cores3-port-spec.md`
-**Status:** Pre-device. M5Stack CoreS3 hardware not yet on desk. All pre-device phases (P0–P9) must produce code, fixtures, or docs that compile/run without the device. Phases P10+ are gated on `MILESTONE: device on desk` and MUST NOT begin until the unit is physically in hand. The plan ports the iPad/Safari client to an M5Stack CoreS3 talking to the existing Python FastAPI backend via a new WebSocket bridge that re-frames Opus binary audio into the ElevenLabs Python SDK `AudioInterface` contract [spec §3, §6]. The Python server stays put; only one new endpoint, one bridge module, one Opus wrapper, one device-token store, and a new top-level `firmware/cores3/` PlatformIO project get added.
+**Review:** `/Users/jakubsikora/Repos/personal/walkie-talkie/thoughts/shared/research/2026-06-02-cores3-spec-plan-review.md`
+**Status:** Pre-device. M5Stack CoreS3 hardware not yet on desk. All pre-device phases (P0–P9, P3.5, P5a/b, X1–X3) must produce code, fixtures, or docs that compile/run without the device. Phases P10+ are gated on `MILESTONE: device on desk` and MUST NOT begin until the unit is physically in hand. The plan ports the iPad/Safari client to an M5Stack CoreS3 talking to the existing Python FastAPI backend via a new WebSocket bridge that re-frames Opus binary audio into the ElevenLabs Python SDK `AudioInterface` contract [spec §3, §6]. The Python server stays put; only one new endpoint, one bridge module, one Opus wrapper, one device-token store, and a new top-level `firmware/cores3/` PlatformIO project get added.
+
+**Revision history:**
+- 2026-06-02 v1: Initial plan from spec.
+- 2026-06-02 v2: After spec↔plan review (`2026-06-02-cores3-spec-plan-review.md`). Removed the `0xFF` binary sentinel (collides with valid Opus TOC bytes — spec §12.X gap #4); locked partial-frame handling to zero-pad (spec §12.X gap #2); split P5 into P5a (refactor) + P5b (wire); added P3.5 live-SDK smoke test; corrected effort math (pre-device 13.50 d, post-device v1 10.50 d, P16 deferred 4 d); clarified RQ-3 AEC is only partially reduced by PTT and carries to P16.
 
 ---
 
@@ -30,8 +35,10 @@ graph TD
   P1[P1: cores3_bridge.py + /ws/cores3 stub]
   P2[P2: opus_codec.py + sine-wave test]
   P3[P3: CoreS3AudioInterface + mock SDK test]
+  P35[P3.5: Live SDK smoke @pytest.mark.live]
   P4[P4: cores3_token.py + ConfigDatabase table + CLI]
-  P5[P5: Server-side tool routing surface]
+  P5a[P5a: Extract API handler bodies]
+  P5b[P5b: Wire client_tools to handlers]
   P6[P6: Python E2E test against /ws/cores3]
   P7[P7: firmware/cores3 PIO skeleton]
   P8[P8: Firmware WS client skeleton]
@@ -53,10 +60,12 @@ graph TD
   P0 --> P7
   P2 --> P3
   P1 --> P3
-  P4 --> P1
-  P1 --> P5
-  P3 --> P5
-  P5 --> P6
+  P3 --> P35
+  P1 --> P4
+  P1 --> P5a
+  P5a --> P5b
+  P3 --> P5b
+  P5b --> P6
   P2 --> P6
   P3 --> P6
   P7 --> P8
@@ -80,20 +89,23 @@ graph TD
   P6 --> P12
   P12 --> P13
   P13 --> P14
-  P5 --> P14
+  P5b --> P14
   P14 --> P15
-  P15 --> P16
 ```
+
+P3.5 is opt-in (no downstream consumer) and P16 is explicitly deferred from the v1 critical path — neither is drawn into the MS gate.
 
 ---
 
 ## Effort Summary
 
-- **Pre-device total (P0–P9, X1–X3):** ~14 dev-days
-  - P0:0.5, P1:1.5, P2:0.5, P3:1.5, P4:1, P5:2, P6:1.5, P7:0.5, P8:1.5, P9:1.5, X1:0.5, X2:0.5, X3:0.25
-- **Post-device total (P10–P16):** ~15 dev-days
-  - P10:1.5, P11:2, P12:1.5, P13:1.5, P14:2, P15:2, P16:4
-- **Grand total:** ~29 dev-days (sized for one engineer, including integration friction)
+- **Pre-device total (P0–P9, X1–X3):** 13.50 dev-days
+  - P0:0.5, P1:1.5, P2:0.5, P3:1.5, P3.5:0.25, P4:1.0, P5a:0.5, P5b:1.5, P6:1.5, P7:0.5, P8:1.5, P9:1.5, X1:0.5, X2:0.5, X3:0.25
+- **Post-device v1 (P10–P15, P16 excluded):** 10.50 dev-days
+  - P10:1.5, P11:2, P12:1.5, P13:1.5, P14:2, P15:2
+- **Deferred backlog (P16, NOT in v1 critical path):** 4 dev-days
+  - Wake-word, battery profiling, on-device LCD UI, AEC evaluation. Tracked separately so it does not inflate the v1 estimate.
+- **Grand total v1:** 24 dev-days (sized for one engineer, including integration friction). With the P16 backlog: 28 dev-days.
 
 ---
 
@@ -205,7 +217,7 @@ graph TD
     - `async def start(self, input_callback)`: stores callback; sets `self._running = True`. Creates an `OpusEncoder` (for outbound TTS) and `OpusDecoder` (for inbound mic) per session [spec §6.3]. Decoder is keyed to mic stream from device; encoder to TTS stream going back.
     - Wait — clarification: the *encoder* is needed for PCM-from-EL → Opus-to-device. The *decoder* is needed for Opus-from-device → PCM-to-EL. The decoder lives in the WS recv path of the session handler, NOT inside the interface. The interface owns the encoder only. Update implementation accordingly.
     - `async def output(self, audio: bytes)`: chunks `audio` (250 ms typical from SDK per [spec §4]) into 320-sample (640-byte) frames; encodes each with the per-session encoder; `await websocket.send_bytes(opus_packet)` for each frame. If `websocket.client_state != CONNECTED`, drop and set `self._dropped += 1`.
-    - `async def interrupt(self)`: send text frame `{"type":"agent_interrupted","ts":<now>}` then a single binary frame with content `b"\xff"` as the flush sentinel per [spec §6.1].
+    - `async def interrupt(self)`: send a single text frame `{"type":"agent_interrupted","ts":<now>}`. **Do NOT also send a 1-byte `0xFF` binary frame** — a valid Opus packet can legally begin with `0xFF`, so a length-1 binary frame is indistinguishable from a malformed Opus packet. The text frame is the sole interrupt signal, per [spec §6.1] and [spec §12.X gap #4].
     - `async def stop(self)`: sets `_running = False`; closes encoder.
   - The session handler's recv loop creates one `OpusDecoder` per `session_start` and uses it to turn every inbound binary frame into PCM, then calls the stored `input_callback(pcm_bytes)` from the SDK.
 - *Touch* `/Users/jakubsikora/Repos/personal/walkie-talkie/project/walkie_agent/tests/test_cores3_bridge_protocol.py` — minor: expand to cover audio path.
@@ -213,20 +225,44 @@ graph TD
 **Acceptance criteria:**
 - `CoreS3AudioInterface` is a true subclass of `AsyncAudioInterface` (introspectable via `issubclass`).
 - A fake `Conversation` test double can call `await interface.start(cb)`, then `await interface.output(b"\x00\x00"*4000)`, then `await interface.interrupt()`, then `await interface.stop()` against a stand-in WebSocket that records all sent frames.
-- After an `output(...)` call with N samples of PCM, the number of binary frames sent equals `ceil(N / 320)`. (e.g. 4000 samples → 13 frames; final frame zero-pads or rejects partial — choose reject + log per [spec §4]; document choice in the code.)
-- `interrupt()` produces exactly one text frame (matching `agent_interrupted`) followed by exactly one binary frame containing only `0xFF`.
+- After an `output(...)` call with N samples of PCM, the number of binary frames sent equals `ceil(N / 320)` (e.g. 4000 samples → 13 frames). **Final partial frame is zero-padded** (per [spec §12.X gap #2]) — dropping it causes audible clicks at TTS chunk boundaries. The padding must be documented inline in `cores3_bridge.py`.
+- `interrupt()` produces exactly **one** text frame matching `agent_interrupted`, and **no** binary frame (regression guard against the removed `0xFF` sentinel).
 
 **Tests required:**
 - `/Users/jakubsikora/Repos/personal/walkie-talkie/project/walkie_agent/tests/test_cores3_audio_interface.py`:
   - `test_subclass_of_async_audio_interface`.
   - `test_output_pcm_chunk_becomes_n_opus_frames` — pre-canned 1-second PCM (sine), assert 50 binary frames sent (1 s / 20 ms).
-  - `test_interrupt_sends_text_then_sentinel` — assert order and content.
+  - `test_interrupt_sends_text_frame_only` — assert exactly one text frame (`{"type":"agent_interrupted", ...}`) and zero binary frames. Regression guard against the removed `0xFF` sentinel ([spec §12.X gap #4]).
+  - `test_output_zero_pads_partial_final_frame` — feed 321 samples; assert 2 binary frames sent, last frame's decoded PCM is 320 samples with the trailing 319 zero-padded.
   - `test_output_after_stop_is_silent` — `await interface.stop()` then `await interface.output(...)` should send 0 frames.
   - `test_input_callback_receives_decoded_pcm` — fake mic: feed an Opus-encoded sine into the session handler via the WebSocket test client, assert the `input_callback` registered on the interface is invoked with 640-byte PCM chunks whose decoded sine reconstructs (uses fixture from P2).
 
 **Estimated effort:** M (1.5 days)
 
 **Depends on:** P1, P2
+
+---
+
+### P3.5 — Live ElevenLabs SDK Smoke Test (Pre-Device, Opt-In)
+
+**Why:** Every other test in P0–P3/P6 uses a mocked `Conversation`. Spec §13 T1 explicitly calls for one real-SDK round-trip before the device arrives, so that "the SDK contract didn't change under our feet" is verified independently of the bridge code. [spec §13 T1, review minor #1]
+
+**Files touched/created:**
+- *Create* `/Users/jakubsikora/Repos/personal/walkie-talkie/project/walkie_agent/tests/test_cores3_sdk_smoke.py`:
+  - One test marked `@pytest.mark.live` (registered in `pyproject.toml` alongside the existing `e2e` marker; excluded from the default `addopts`).
+  - Skipped when `WALKIE_ELEVENLABS_API_KEY` is unset.
+  - Instantiates `CoreS3AudioInterface` against a real `Conversation` session with the configured default agent and a `partial_conversation_history` of one user turn ("Powiedz cześć"). Asserts the SDK calls `output(...)` with non-empty PCM at least once and `interrupt()` is never called.
+
+**Acceptance criteria:**
+- `pytest tests/walkie_agent/tests/test_cores3_sdk_smoke.py -m live -v` passes when run manually with a real key.
+- Default `pytest` run skips it cleanly.
+- The fake WebSocket the test wraps `CoreS3AudioInterface` around records ≥1 binary frame and zero `interrupt` frames.
+
+**Tests required:** This task IS the test.
+
+**Estimated effort:** S (0.25 days)
+
+**Depends on:** P3
 
 ---
 
@@ -269,9 +305,33 @@ graph TD
 
 ---
 
-### P5 — Server: Tool Routing Surface (Server-Side Re-implementation of Browser Tools)
+### P5a — Refactor: Extract API tool handler bodies into importable functions
 
-**Why:** The browser today runs every tool as JavaScript. The CoreS3 has no JS runtime. The bridge must register the same tool surface against the SDK's `client_tools` argument and route the spec-§6.5 table to either internal HTTP-equivalent calls or no-op acks. [spec §6.5]
+**Why:** P5b needs to call the existing `/api/tools/*` handlers in-process without going through HTTP. Splitting this out from the tool-routing work (P5b) keeps the refactor reviewable on its own and avoids mixing a non-trivial code move with new logic. [spec §6.5, review minor #4]
+
+**Files touched/created:**
+- *Touch* `/Users/jakubsikora/Repos/personal/walkie-talkie/project/walkie_agent/api.py` — for each tool route, factor the body into a module-level `async def _handle_<tool>(...)` and have the existing `@app.post("/api/tools/...")` route call it. Behavioural no-op. Affects: `send-message`, `parent-location`, `ask-expert`, `homepod`, `recall-memory`, `remember`, `create-animation`.
+
+**Acceptance criteria:**
+- All existing HTTP routes return the same payload shape as before for the same inputs.
+- Every extracted `_handle_*` function is importable: `from walkie_agent.api import _handle_send_message`.
+- Existing browser flow (iPad → server) unchanged — verified via the default test suite still green.
+
+**Tests required:**
+- All pre-existing API tests still pass without modification. No new tests.
+- `/Users/jakubsikora/Repos/personal/walkie-talkie/project/walkie_agent/tests/test_api_handlers_importable.py`:
+  - `test_handle_send_message_importable_and_callable` — `import _handle_send_message`, call it with mocked deps, assert non-None payload.
+  - Same shape for the other 6 handlers.
+
+**Estimated effort:** S (0.5 days)
+
+**Depends on:** P1
+
+---
+
+### P5b — Wire ConvAI client_tools surface to the extracted handlers
+
+**Why:** The browser runs every tool as JavaScript today. The CoreS3 has no JS runtime. The bridge must register the same tool surface against the SDK's `client_tools` argument and route the spec-§6.5 table to either the in-process handlers from P5a or no-op acks. [spec §6.5]
 
 **Files touched/created:**
 - *Touch* `/Users/jakubsikora/Repos/personal/walkie-talkie/project/walkie_agent/cores3_bridge.py`:
@@ -282,15 +342,14 @@ graph TD
     - `show_animation(animation_name)`: log + emit `tool_event` only. No DOM. Return `"ok"` to satisfy SDK.
     - `go_to_sleep()`: same as a device-initiated `session_end`; emit `session_ended`. Return `"sleeping"`.
     - `game_control(action)`: log + emit `tool_event`. Return `"ok"`.
-    - `play_on_speaker(*args)`: import the existing `/api/tools/homepod` handler function (NOT via HTTP), call it directly with FastAPI's `Depends`-injected db where needed. Emit `tool_event`. Return the handler's response payload.
-    - `recall_memory(query)`: same pattern, call `/api/tools/recall-memory` handler in-process. Return the recalled text so the SDK injects it.
-    - `remember(text)`: same pattern, call `/api/tools/remember` in-process. Return ack.
+    - `play_on_speaker(*args)`: call `_handle_homepod` from P5a. Emit `tool_event`. Return the handler's response payload.
+    - `recall_memory(query)`: call `_handle_recall_memory` from P5a. Return the recalled text so the SDK injects it.
+    - `remember(text)`: call `_handle_remember` from P5a. Return ack.
     - `create_animation(spec)`: log + emit `tool_event`. Return `"ok"`.
-    - `send_message(text)`: call `/api/tools/send-message` in-process (passes through ParentInbox).
-    - `parent_location()`: call `/api/tools/parent-location` in-process.
-    - `ask_expert(query)`: call `/api/tools/ask-expert` in-process.
+    - `send_message(text)`: call `_handle_send_message` from P5a (passes through ParentInbox).
+    - `parent_location()`: call `_handle_parent_location` from P5a.
+    - `ask_expert(query)`: call `_handle_ask_expert` from P5a.
   - `cores3_session_handler` wires `client_tools=build_cores3_tools(...)` into the `Conversation` it instantiates.
-- *Touch* `/Users/jakubsikora/Repos/personal/walkie-talkie/project/walkie_agent/api.py` — ensure the underlying tool handler functions are exposed importably (factor out the body of each `@app.post("/api/tools/...")` handler into a plain `async def _handle_send_message(...)` that both the route wrapper and the bridge can call). The existing HTTP routes stay unchanged for the browser and ElevenLabs webhook tools.
 
 **Acceptance criteria:**
 - 11 tools registered against the SDK exactly match the spec §6.5 table by name.
@@ -301,14 +360,14 @@ graph TD
 **Tests required:**
 - `/Users/jakubsikora/Repos/personal/walkie-talkie/project/walkie_agent/tests/test_cores3_tool_routing.py`:
   - For each of the 11 tools: `test_<tool>_emits_tool_event_and_returns_string` — using a fake WebSocket, call the tool function directly; assert it sends the right text frame.
-  - `test_send_message_routes_to_existing_handler` — patch `_handle_send_message` with a Mock; call the bridge tool; assert called with same args.
+  - `test_send_message_routes_to_extracted_handler` — patch `_handle_send_message` with a Mock; call the bridge tool; assert called with same args.
   - `test_switch_character_ends_session_and_updates_state` — fake Conversation with `end_session` mock; assert called.
   - `test_switch_character_rejects_unknown_character`.
   - `test_recall_memory_returns_handler_payload`.
 
-**Estimated effort:** L (2 days)
+**Estimated effort:** M (1.5 days)
 
-**Depends on:** P1, P3
+**Depends on:** P1, P3, P5a
 
 ---
 
@@ -341,7 +400,7 @@ graph TD
 
 **Estimated effort:** M (1.5 days)
 
-**Depends on:** P2, P3, P5
+**Depends on:** P2, P3, P5b
 
 ---
 
@@ -548,7 +607,7 @@ Verification before starting P10:
 
 ### P14 — Tool Surface Validation On-Device
 
-**Why:** Walk through each tool from [spec §6.5] on real hardware to confirm the server-side routing in P5 actually behaves correctly when called by the live agent. [spec §6.5]
+**Why:** Walk through each tool from [spec §6.5] on real hardware to confirm the server-side routing in P5b actually behaves correctly when called by the live agent. [spec §6.5]
 
 **Files touched/created:**
 - *Create* `/Users/jakubsikora/Repos/personal/walkie-talkie/firmware/cores3/docs/p14_tool_validation_matrix.md` — checklist (one row per tool) with: prompt to provoke the call, expected `tool_event` frame on the device, expected backend side-effect (e.g. Telegram message landed for `send_message`).
@@ -566,7 +625,7 @@ Verification before starting P10:
 
 **Estimated effort:** L (2 days)
 
-**Depends on:** P13, P5
+**Depends on:** P13, P5b
 
 ---
 
@@ -649,7 +708,8 @@ Verification before starting P10:
 **Files touched/created:**
 - *Create* `/Users/jakubsikora/Repos/personal/walkie-talkie/thoughts/shared/plans/2026-06-02-cores3-port-risk-register.md`:
   - Verbatim copy of [spec §12] RQ-1 through RQ-5 with the bold subheadings preserved.
-  - Append a `Status` column per RQ with default value `OPEN`. After each post-device phase that resolves an RQ, the executor flips to `CLOSED — see <phase>`. RQ-1 closes at P10/P11, RQ-3 reduced at P13, RQ-4 measured at P12, RQ-5 documented at P4.
+  - Append a `Status` column per RQ with default value `OPEN`. After each post-device phase that resolves an RQ, the executor flips to `CLOSED — see <phase>`. RQ-1 closes at P10/P11, RQ-3 (AEC echo risk) is *partially* reduced at P13 (touchscreen PTT gates the mic while TTS plays — fewer overlap windows than wake-word always-on would have), but full mitigation requires either esp-sr AFE or post-device measurement; carried forward to P16. RQ-4 measured at P12, RQ-5 documented at P4.
+  - Also lift the 7 entries from [spec §12.X Spec Gaps from 2026-06-02 Planning Audit] as a separate "Planning-audit gaps" section in this register, so they aren't only visible if a reader scrolls the spec.
 
 **Acceptance criteria:**
 - File exists, content matches spec §12 word-for-word in the body.
@@ -693,8 +753,10 @@ Verification before starting P10:
 | P1 | Bridge skeleton + endpoint | M | `walkie_agent/cores3_bridge.py` | `walkie_agent/api.py`, `pyproject.toml` |
 | P2 | Opus codec wrapper | S | `walkie_agent/opus_codec.py` | `pyproject.toml` |
 | P3 | `CoreS3AudioInterface` real | M | (new test) | `walkie_agent/cores3_bridge.py` |
+| P3.5 | Live SDK smoke (opt-in) | XS | `tests/test_cores3_sdk_smoke.py` | `pyproject.toml` (live marker) |
 | P4 | Device token + CLI | M | `walkie_agent/cores3_token.py` | `walkie_agent/config/database.py`, `walkie_agent/main.py`, `walkie_agent/cores3_bridge.py` |
-| P5 | Tool routing surface | L | (new test) | `walkie_agent/cores3_bridge.py`, `walkie_agent/api.py` |
+| P5a | Extract API tool handler bodies | S | (new test) | `walkie_agent/api.py` |
+| P5b | Wire client_tools to handlers | M | (new test) | `walkie_agent/cores3_bridge.py` |
 | P6 | Python E2E test | M | tests + 2 fixtures | — |
 | P7 | Firmware PIO skeleton | S | `firmware/cores3/*` (platformio.ini, src/main.cpp, .gitignore, lib/, include/) | — |
 | P8 | Firmware WS client skeleton | M | `firmware/cores3/src/{net,protocol,state,config}/*` | `firmware/cores3/src/main.cpp`, `platformio.ini` |
