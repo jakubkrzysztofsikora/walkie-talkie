@@ -6,6 +6,7 @@ project/walkie_agent/__pycache__/
 __pycache__/
 *.pyc
 .DS_Store
+.claude/
 node_modules/
 tests/ui/playwright-report/
 tests/ui/test-results/
