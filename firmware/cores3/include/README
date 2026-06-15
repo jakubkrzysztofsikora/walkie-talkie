@@ -1,0 +1,2 @@
+Placeholder for shared headers.
+P8+ will add: net/ws_client.h, protocol/control_messages.h, state/state_machine.h, audio/*.h

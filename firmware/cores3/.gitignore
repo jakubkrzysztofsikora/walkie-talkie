@@ -1,0 +1,5 @@
+.pio/
+.vscode/
+compile_commands.json
+src/config/secrets.h
+.cores3.deploy.env
