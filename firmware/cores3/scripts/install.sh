@@ -33,12 +33,18 @@ echo "    firmware dir: $FIRMWARE_DIR"
 ok "macOS ARM64 confirmed"
 
 # ---- 2. Homebrew: libopus ---------------------------------------------------
-echo "==> Checking libopus (brew)"
-if brew list opus &>/dev/null; then
-    ok "libopus already installed"
+# brew is not on PATH in non-interactive SSH; use absolute path.
+BREW=/opt/homebrew/bin/brew
+if [ ! -x "$BREW" ]; then
+    warn "Homebrew not found at $BREW — skipping brew deps"
 else
-    echo "    Installing libopus via Homebrew..."
-    brew install opus && ok "libopus installed" || warn "brew install opus failed (non-fatal for firmware builds)"
+    echo "==> Checking libopus (brew)"
+    if $BREW list opus &>/dev/null; then
+        ok "libopus already installed"
+    else
+        echo "    Installing libopus via Homebrew..."
+        $BREW install opus && ok "libopus installed" || warn "brew install opus failed (non-fatal for firmware builds)"
+    fi
 fi
 
 # ---- 3. PlatformIO Core (system Python 3.9, NOT the .venv) ------------------
