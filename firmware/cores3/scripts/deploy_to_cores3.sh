@@ -16,6 +16,8 @@
 
 set -euo pipefail
 
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+
 LOCAL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$LOCAL_ROOT/.."  # repo root (walkie-talkie/)
 
@@ -38,6 +40,23 @@ else
 fi
 
 MODE="${1:-full}"
+
+case "$MODE" in
+    full|--no-flash|--build-only|--flash-only) ;;
+    -h|--help)
+        echo "Usage: $0 [full|--no-flash|--build-only|--flash-only]"
+        echo "  full          Sync + build + flash (default)"
+        echo "  --no-flash    Sync + build only"
+        echo "  --build-only  Build only (no sync)"
+        echo "  --flash-only  Flash last build (no sync)"
+        exit 0
+        ;;
+    *)
+        echo -e "${RED}Error: unknown flag '$MODE'${NC}"
+        echo "Usage: $0 [full|--no-flash|--build-only|--flash-only]"
+        exit 2
+        ;;
+esac
 
 # ---- 1. Sync code ------------------------------------------------------------
 if [ "$MODE" != "--build-only" ] && [ "$MODE" != "--flash-only" ]; then

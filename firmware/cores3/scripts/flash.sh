@@ -23,6 +23,23 @@ export PATH="$PIO_PATH:$PATH"
 
 MODE="${1:-full}"
 
+# Validate mode
+case "$MODE" in
+    full|--no-build|--monitor) ;;
+    -h|--help)
+        echo "Usage: $0 [full|--no-build|--monitor]"
+        echo "  full        Build + flash + verify (default)"
+        echo "  --no-build  Flash last build + verify (skip compile)"
+        echo "  --monitor   Open serial monitor only (no flash)"
+        exit 0
+        ;;
+    *)
+        echo -e "${RED}Error: unknown flag '$MODE'${NC}"
+        echo "Usage: $0 [full|--no-build|--monitor]"
+        exit 2
+        ;;
+esac
+
 # ---- Detect CoreS3 port ------------------------------------------------------
 detect_port() {
     # The CoreS3 shows as /dev/cu.usbmodem* (ESP32-S3 built-in USB-serial-JTAG)
