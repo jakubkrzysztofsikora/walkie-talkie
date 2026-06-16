@@ -239,9 +239,11 @@ void setup() {
     {
         auto spk_cfg = M5.Speaker.config();
         spk_cfg.sample_rate = OPUS_SAMPLE_RATE;
+        spk_cfg.dma_buf_len = 512;  // stack = 1280 + 512*4 = 3328 bytes
         M5.Speaker.config(spk_cfg);
         auto mic_cfg = M5.Mic.config();
         mic_cfg.sample_rate = OPUS_SAMPLE_RATE;
+        mic_cfg.dma_buf_len = 1024;  // stack = 2048 + 1024*2 = 4096 bytes
         M5.Mic.config(mic_cfg);
     }
     // Start in speaker mode (idle: ready to hear agent)
