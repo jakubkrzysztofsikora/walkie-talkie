@@ -179,9 +179,21 @@ void setup() {
 
     auto cfg = M5.config();
     cfg.serial_baudrate = 115200;
-    cfg.internal_mic = false;  // P10
-    cfg.internal_spk = false;
+    cfg.internal_mic = true;
+    cfg.internal_spk = true;
     M5.begin(cfg);
+    // Configure both at 16kHz before use
+    {
+        auto spk_cfg = M5.Speaker.config();
+        spk_cfg.sample_rate = OPUS_SAMPLE_RATE;
+        M5.Speaker.config(spk_cfg);
+        auto mic_cfg = M5.Mic.config();
+        mic_cfg.sample_rate = OPUS_SAMPLE_RATE;
+        M5.Mic.config(mic_cfg);
+    }
+    // Start in speaker mode (idle: ready to hear agent)
+    M5.Mic.end();
+    M5.Speaker.begin();
     Serial.printf("Board:%d Battery:%d%%\n", M5.getBoard(), M5.Power.getBatteryLevel());
 
     M5.Lcd.setRotation(1);
@@ -237,6 +249,9 @@ void loop() {
             touch_pressed = true;
             touch_down_at = now;
             if (state == DeviceState::IDLE) {
+                // Switch to mic mode
+                M5.Speaker.end();
+                M5.Mic.begin();
                 send_session_start();
                 Serial.println("→ SESSION_ACTIVE (PTT)");
             }
@@ -248,7 +263,27 @@ void loop() {
         if (state == DeviceState::SESSION_ACTIVE) {
             send_session_end();
             state = DeviceState::IDLE;
+            // Switch back to speaker mode
+            M5.Mic.end();
+            M5.Speaker.begin();
             Serial.println("→ IDLE (PTT release)");
+        }
+    }
+
+    // Audio: record mic → Opus encode → WS send (during PTT hold)
+    static int16_t* mic_buf = nullptr;
+    static uint8_t* opus_out = nullptr;
+    if (!mic_buf) {
+        mic_buf = (int16_t*)heap_caps_malloc(OPUS_FRAME_SAMPLES * 2, MALLOC_CAP_SPIRAM);
+        opus_out = (uint8_t*)heap_caps_malloc(128, MALLOC_CAP_SPIRAM);
+    }
+    if (state == DeviceState::SESSION_ACTIVE && touch_pressed && M5.Mic.isEnabled() && mic_buf && opus_out) {
+        size_t recorded = M5.Mic.record(mic_buf, OPUS_FRAME_SAMPLES, OPUS_SAMPLE_RATE);
+        if (recorded == OPUS_FRAME_SAMPLES) {
+            int pkt_len = opus_encode_frame(mic_buf, opus_out, 128);
+            if (pkt_len > 0) {
+                ws.sendBIN(opus_out, pkt_len);
+            }
         }
     }
 
