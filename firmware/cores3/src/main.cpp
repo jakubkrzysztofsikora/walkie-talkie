@@ -14,9 +14,17 @@
 #include <WiFi.h>
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
+#include <esp_heap_caps.h>
 
 #include "config/secrets.h"
 #include "audio/opus_stub.h"
+
+// Override default 8KB loopTask stack (CONFIG_ARDUINO_LOOP_STACK_SIZE).
+// WiFi + WebSocket + JSON + M5Unified collectively exceed 8KB.
+// Declared __attribute__((weak)) in Arduino.h with C++ linkage.
+size_t getArduinoLoopTaskStackSize(void) {
+    return 16384;  // 16 KB
+}
 
 // ---------------------------------------------------------------------------
 // State machine
@@ -111,24 +119,12 @@ void setup() {
     Serial.println("\ncores3 walkie-talkie boot");
 
     // M5Unified BSP
+    // Audio (mic+speaker) deferred to P10 — M5.Mic/Speaker I2S callbacks
+    // overflow the default 8KB loopTask stack when combined with WS+WiFi.
     auto cfg = M5.config();
     cfg.serial_baudrate = 115200;
     M5.begin(cfg);
     Serial.printf("Board:%d Battery:%d%%\n", M5.getBoard(), M5.Power.getBatteryLevel());
-
-    // Audio: configure mic + speaker for 16kHz mono
-    {
-        auto spk_cfg = M5.Speaker.config();
-        spk_cfg.sample_rate = OPUS_SAMPLE_RATE;
-        spk_cfg.buzzer = false;
-        M5.Speaker.config(spk_cfg);
-        M5.Speaker.begin();
-
-        auto mic_cfg = M5.Mic.config();
-        mic_cfg.sample_rate = OPUS_SAMPLE_RATE;
-        M5.Mic.config(mic_cfg);
-        M5.Mic.begin();
-    }
 
     // Opus codec
     if (!opus_stub_init()) {
@@ -171,20 +167,10 @@ void loop() {
         last_keepalive = now; send_keepalive();
     }
 
-    // Audio loop: record mic → Opus encode → WS send (when session active)
-    if (state == DeviceState::SESSION_ACTIVE) {
-        if (M5.Mic.isEnabled()) {
-            int16_t buf[OPUS_FRAME_SAMPLES];
-            size_t recorded = M5.Mic.record(buf, OPUS_FRAME_SAMPLES, OPUS_SAMPLE_RATE);
-            if (recorded == OPUS_FRAME_SAMPLES) {
-                uint8_t opus_pkt[128];
-                int pkt_len = opus_encode_frame(buf, opus_pkt, sizeof(opus_pkt));
-                if (pkt_len > 0) {
-                    ws.sendBIN(opus_pkt, pkt_len);
-                }
-            }
-        }
-    }
+    // Audio loop (P10): mic → Opus encode → WS send
+    // Deferred — requires FreeRTOS task pinning to avoid loopTask stack overflow.
+    // Current wiring compiles and links but M5.Mic.record + opus_encode + ws.sendBIN
+    // exceeds the default 8KB loopTask stack. See platformio.ini STACK_SIZE note.
 
     // Demo: auto-start session after 8s, end after 25s (P13 replaces this with touch PTT)
     if (state == DeviceState::IDLE && !demo_session_sent && now > 8000) {
