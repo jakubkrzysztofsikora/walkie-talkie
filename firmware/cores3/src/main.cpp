@@ -14,6 +14,7 @@
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include <esp_heap_caps.h>
+#include <cmath>
 
 #include "config/secrets.h"
 #include "audio/opus_stub.h"
@@ -106,10 +107,23 @@ static void ws_handler(WStype_t type, uint8_t* payload, size_t len) {
         }
         case WStype_BIN:
             // TTS Opus from server → decode → speaker
+            // Buffer multiple frames (200ms) before playing to avoid DMA underrun.
             if (state == DeviceState::SESSION_ACTIVE) {
-                int16_t pcm[OPUS_FRAME_SAMPLES];
-                int samples = opus_decode_frame(payload, len, pcm);
-                if (samples > 0) M5.Speaker.playRaw(pcm, samples, OPUS_SAMPLE_RATE, false);
+                static int16_t* spk_ring = nullptr;
+                static int spk_ring_pos = 0;
+                static const int SPK_RING_SAMPLES = OPUS_FRAME_SAMPLES * 10; // 200ms
+                if (!spk_ring) spk_ring = (int16_t*)heap_caps_malloc(SPK_RING_SAMPLES * 2, MALLOC_CAP_SPIRAM);
+                if (spk_ring) {
+                    int samples = opus_decode_frame(payload, len, spk_ring + spk_ring_pos);
+                    if (samples > 0) spk_ring_pos += samples;
+                    // Play when we have >= 200ms buffered
+                    if (spk_ring_pos >= SPK_RING_SAMPLES) {
+                        M5.Speaker.playRaw(spk_ring, spk_ring_pos, OPUS_SAMPLE_RATE, false);
+                        // Allocate new buffer for next chunk
+                        spk_ring = (int16_t*)heap_caps_malloc(SPK_RING_SAMPLES * 2, MALLOC_CAP_SPIRAM);
+                        spk_ring_pos = 0;
+                    }
+                }
             }
             break;
         default: break;
@@ -137,54 +151,78 @@ static bool wifi_connect(const char* ssid, const char* pass, unsigned long timeo
 // Display
 // ---------------------------------------------------------------------------
 
-static void draw_ui() {
-    // Background color signals state
-    uint16_t bg;
-    const char* label;
-    switch (state) {
-        case DeviceState::SESSION_ACTIVE: bg = TFT_RED;    label = "TALKING";   break;
-        case DeviceState::WSS_CONNECT:    bg = TFT_BLUE;   label = "CONNECTING";break;
-        case DeviceState::WIFI_CONNECT:   bg = TFT_ORANGE; label = "WIFI...";   break;
-        default:                          bg = TFT_DARKGREEN; label = "GOTOWY"; break;
-    }
+// Tamagotchi-style pixel face renderer
+static uint16_t last_bg = 0xFFFF;  // force initial draw
+
+static void draw_face( uint16_t bg) {
+    // Only full-redraw on state change
+    static DeviceState last_state = DeviceState::BOOT;
+    if (state == last_state && bg == last_bg) return;
+    last_state = state; last_bg = bg;
 
     M5.Lcd.fillScreen(bg);
 
-    // Main label
-    M5.Lcd.setTextColor(TFT_WHITE, bg);
-    M5.Lcd.setTextSize(3);
-    M5.Lcd.setCursor(20, 30);
-    M5.Lcd.println(label);
+    int cx = 160, cy = 80;  // face center (landscape 320x240, rotated)
 
-    // IP + RSSI
-    M5.Lcd.setTextSize(1);
-    M5.Lcd.setTextColor(TFT_WHITE, bg);
-    M5.Lcd.setCursor(20, 70);
-    if (WiFi.isConnected())
-        M5.Lcd.printf("IP: %s  %ddBm", WiFi.localIP().toString().c_str(), WiFi.RSSI());
-    else
-        M5.Lcd.print("WiFi: DOWN");
+    // Draw circular face background
+    M5.Lcd.fillCircle(cx, cy, 55, TFT_BLACK);
+    M5.Lcd.drawCircle(cx, cy, 55, TFT_WHITE);
 
-    // Battery
-    M5.Lcd.setCursor(20, 85);
-    M5.Lcd.printf("Batt: %d%%  Heap: %dK", M5.Power.getBatteryLevel(), ESP.getFreeHeap() / 1024);
+    // Eyes — two white circles with black pupils that move based on state
+    int eye_y = cy - 15;
+    int eye_spacing = 22;
+    int pupil_offset = (state == DeviceState::SESSION_ACTIVE) ? 5 : 0;
 
-    // PTT hint
-    if (state == DeviceState::IDLE) {
-        M5.Lcd.setTextSize(2);
-        M5.Lcd.setTextColor(TFT_WHITE, bg);
-        M5.Lcd.setCursor(20, 110);
-        M5.Lcd.println("Nacisnij i mow");
+    M5.Lcd.fillCircle(cx - eye_spacing, eye_y, 12, TFT_WHITE);
+    M5.Lcd.fillCircle(cx + eye_spacing, eye_y, 12, TFT_WHITE);
+    M5.Lcd.fillCircle(cx - eye_spacing + pupil_offset, eye_y + 2, 5, TFT_BLACK);
+    M5.Lcd.fillCircle(cx + eye_spacing + pupil_offset, eye_y + 2, 5, TFT_BLACK);
+
+    // Mouth — changes expression by state
+    int mouth_y = cy + 20;
+    if (state == DeviceState::SESSION_ACTIVE) {
+        // Talking: open circle mouth
+        M5.Lcd.fillCircle(cx, mouth_y + 5, 10, TFT_RED);
+    } else if (state == DeviceState::WSS_CONNECT || state == DeviceState::WIFI_CONNECT) {
+        // Connecting: flat line
+        M5.Lcd.drawLine(cx - 12, mouth_y, cx + 12, mouth_y, TFT_WHITE);
+    } else {
+        // Idle: happy smile
+        M5.Lcd.fillRect(cx - 12, mouth_y, 24, 6, TFT_WHITE);
+        M5.Lcd.fillRect(cx - 8, mouth_y - 4, 16, 4, bg);  // erase center
     }
 
-    // Character name
-    M5.Lcd.setTextSize(2);
-    M5.Lcd.setTextColor(TFT_CYAN, bg);
-    M5.Lcd.setCursor(20, 130);
-    M5.Lcd.println(CHARACTERS[current_char_idx]);
+    // Ears (small circles at top sides)
+    M5.Lcd.fillCircle(cx - 52, cy - 25, 10, TFT_BLACK);
+    M5.Lcd.drawCircle(cx - 52, cy - 25, 10, TFT_WHITE);
+    M5.Lcd.fillCircle(cx + 52, cy - 25, 10, TFT_BLACK);
+    M5.Lcd.drawCircle(cx + 52, cy - 25, 10, TFT_WHITE);
+
+    // Character name below face
     M5.Lcd.setTextSize(1);
-    M5.Lcd.setCursor(20, 155);
-    M5.Lcd.println("double-tap: zmien postac");
+    M5.Lcd.setTextColor(TFT_WHITE, bg);
+    M5.Lcd.setCursor(cx - 30, cy + 65);
+    M5.Lcd.println(CHARACTERS[current_char_idx]);
+
+    // Status bar at bottom
+    M5.Lcd.setTextSize(1);
+    M5.Lcd.setTextColor(TFT_DARKGREY, bg);
+    M5.Lcd.setCursor(5, 228);
+    if (WiFi.isConnected())
+        M5.Lcd.printf("wifi:%ddBm batt:%d%%", WiFi.RSSI(), M5.Power.getBatteryLevel());
+    else
+        M5.Lcd.print("wifi:DOWN");
+}
+
+static void draw_ui() {
+    uint16_t bg;
+    switch (state) {
+        case DeviceState::SESSION_ACTIVE: bg = TFT_RED;     break;
+        case DeviceState::WSS_CONNECT:    bg = TFT_BLUE;    break;
+        case DeviceState::WIFI_CONNECT:   bg = TFT_ORANGE;  break;
+        default:                          bg = TFT_DARKGREEN;break;
+    }
+    draw_face(bg);
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +252,17 @@ void setup() {
     M5.Mic.end();
     M5.Speaker.begin();
     Serial.printf("Board:%d Battery:%d%%\n", M5.getBoard(), M5.Power.getBatteryLevel());
+
+    // Audio self-test: play 440Hz tone for 500ms to verify speaker chain
+    Serial.println("Audio test: 440Hz tone...");
+    const int test_len = 8000;  // 500ms @ 16kHz
+    static int16_t test_tone[test_len];
+    for (int i = 0; i < test_len; i++) {
+        test_tone[i] = (int16_t)(sin(2.0 * PI * 440 * i / 16000) * 8000);
+    }
+    M5.Speaker.playRaw((const int16_t*)test_tone, test_len, 16000, false);
+    delay(600);  // let tone play
+    Serial.println("Audio test done");
 
     M5.Lcd.setRotation(1);
     M5.Lcd.fillScreen(TFT_BLACK);
