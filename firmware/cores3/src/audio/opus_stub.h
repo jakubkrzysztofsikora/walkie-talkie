@@ -12,7 +12,7 @@
 #define OPUS_FRAME_MS     20
 #define OPUS_FRAME_SAMPLES 320
 #define OPUS_FRAME_BYTES  640
-#define OPUS_BITRATE      16000
+#define OPUS_BITRATE      48000
 
 // Init encoder + decoder. Allocate state from PSRAM.
 // Returns true on success.

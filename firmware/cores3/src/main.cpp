@@ -14,13 +14,12 @@
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include <esp_heap_caps.h>
-#include <cmath>
 
 #include "config/secrets.h"
 #include "audio/opus_stub.h"
 
 // Override default 8KB loopTask stack
-size_t getArduinoLoopTaskStackSize(void) { return 16384; }
+size_t getArduinoLoopTaskStackSize(void) { return 24576; }
 
 // ---------------------------------------------------------------------------
 // State machine
@@ -106,22 +105,19 @@ static void ws_handler(WStype_t type, uint8_t* payload, size_t len) {
             break;
         }
         case WStype_BIN:
-            // TTS Opus from server → decode → speaker
-            // Buffer multiple frames (200ms) before playing to avoid DMA underrun.
+            // TTS Opus from server → decode → stream to speaker
+            // Single channel, playRaw with stop_current_sound=false so frames
+            // queue sequentially instead of overlapping.
             if (state == DeviceState::SESSION_ACTIVE) {
-                static int16_t* spk_ring = nullptr;
-                static int spk_ring_pos = 0;
-                static const int SPK_RING_SAMPLES = OPUS_FRAME_SAMPLES * 10; // 200ms
-                if (!spk_ring) spk_ring = (int16_t*)heap_caps_malloc(SPK_RING_SAMPLES * 2, MALLOC_CAP_SPIRAM);
-                if (spk_ring) {
-                    int samples = opus_decode_frame(payload, len, spk_ring + spk_ring_pos);
-                    if (samples > 0) spk_ring_pos += samples;
-                    // Play when we have >= 200ms buffered
-                    if (spk_ring_pos >= SPK_RING_SAMPLES) {
-                        M5.Speaker.playRaw(spk_ring, spk_ring_pos, OPUS_SAMPLE_RATE, false);
-                        // Allocate new buffer for next chunk
-                        spk_ring = (int16_t*)heap_caps_malloc(SPK_RING_SAMPLES * 2, MALLOC_CAP_SPIRAM);
-                        spk_ring_pos = 0;
+                static int16_t* spk_buf = nullptr;
+                if (!spk_buf) spk_buf = (int16_t*)heap_caps_malloc(OPUS_FRAME_SAMPLES * 2, MALLOC_CAP_SPIRAM);
+                if (spk_buf) {
+                    int samples = opus_decode_frame(payload, len, spk_buf);
+                    if (samples > 0) {
+                        // channel 0, stop_current=false — queue frames sequentially
+                        M5.Speaker.playRaw(spk_buf, samples, OPUS_SAMPLE_RATE, false, 1, 0, false);
+                        // Allocate fresh buffer for next frame so previous isn't overwritten
+                        spk_buf = (int16_t*)heap_caps_malloc(OPUS_FRAME_SAMPLES * 2, MALLOC_CAP_SPIRAM);
                     }
                 }
             }
@@ -252,17 +248,6 @@ void setup() {
     M5.Mic.end();
     M5.Speaker.begin();
     Serial.printf("Board:%d Battery:%d%%\n", M5.getBoard(), M5.Power.getBatteryLevel());
-
-    // Audio self-test: play 440Hz tone for 500ms to verify speaker chain
-    Serial.println("Audio test: 440Hz tone...");
-    const int test_len = 8000;  // 500ms @ 16kHz
-    static int16_t test_tone[test_len];
-    for (int i = 0; i < test_len; i++) {
-        test_tone[i] = (int16_t)(sin(2.0 * PI * 440 * i / 16000) * 8000);
-    }
-    M5.Speaker.playRaw((const int16_t*)test_tone, test_len, 16000, false);
-    delay(600);  // let tone play
-    Serial.println("Audio test done");
 
     M5.Lcd.setRotation(1);
     M5.Lcd.fillScreen(TFT_BLACK);
