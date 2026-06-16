@@ -1,12 +1,11 @@
 /**
  * CoreS3 Walkie-Talkie — main entry point
  *
- * P7: M5Unified + Wi-Fi
- * P8: WebSocket client + control protocol + state machine
- * P9: Opus codec (micro-opus)
- * P10: Audio I2S via M5Unified Mic/Speaker
- *
- * Spec: thoughts/shared/research/2026-06-01-cores3-port-spec.md
+ * P7:  M5Unified BSP + Wi-Fi
+ * P8:  WebSocket client + control protocol + state machine
+ * P9:  Opus codec
+ * P13: Touchscreen PTT + color-coded status display
+ * P10: Audio I2S (deferred — needs FreeRTOS task pinning)
  */
 
 #include <Arduino.h>
@@ -19,12 +18,8 @@
 #include "config/secrets.h"
 #include "audio/opus_stub.h"
 
-// Override default 8KB loopTask stack (CONFIG_ARDUINO_LOOP_STACK_SIZE).
-// WiFi + WebSocket + JSON + M5Unified collectively exceed 8KB.
-// Declared __attribute__((weak)) in Arduino.h with C++ linkage.
-size_t getArduinoLoopTaskStackSize(void) {
-    return 16384;  // 16 KB
-}
+// Override default 8KB loopTask stack
+size_t getArduinoLoopTaskStackSize(void) { return 16384; }
 
 // ---------------------------------------------------------------------------
 // State machine
@@ -33,28 +28,41 @@ size_t getArduinoLoopTaskStackSize(void) {
 enum class DeviceState { BOOT, WIFI_CONNECT, WSS_CONNECT, IDLE, SESSION_ACTIVE };
 static DeviceState state = DeviceState::BOOT;
 
-// ---------------------------------------------------------------------------
-// WebSocket
-// ---------------------------------------------------------------------------
+// Touch PTT
+static bool touch_pressed = false;
+static unsigned long touch_down_at = 0;
+static const unsigned long TOUCH_DEBOUNCE_MS = 50;
 
+// WebSocket
 static WebSocketsClient ws;
 
+// ---------------------------------------------------------------------------
+// WebSocket helpers
+// ---------------------------------------------------------------------------
+
 static void send_json(const char* type) {
-    StaticJsonDocument<128> doc;
+    JsonDocument doc;
     doc["type"] = type;
     doc["ts"] = millis() / 1000;
-    String out;
-    serializeJson(doc, out);
-    ws.sendTXT(out);
+    String out; serializeJson(doc, out); ws.sendTXT(out);
 }
 
 static void send_keepalive() {
-    StaticJsonDocument<64> doc;
-    doc["type"] = "keepalive";
-    doc["ts"] = millis() / 1000;
-    String out;
-    serializeJson(doc, out);
-    ws.sendTXT(out);
+    JsonDocument doc;
+    doc["type"] = "keepalive"; doc["ts"] = millis() / 1000;
+    String out; serializeJson(doc, out); ws.sendTXT(out);
+}
+
+static void send_session_start() {
+    JsonDocument doc;
+    doc["type"] = "session_start"; doc["ts"] = millis() / 1000;
+    String out; serializeJson(doc, out); ws.sendTXT(out);
+}
+
+static void send_session_end() {
+    JsonDocument doc;
+    doc["type"] = "session_end"; doc["ts"] = millis() / 1000;
+    String out; serializeJson(doc, out); ws.sendTXT(out);
 }
 
 static void ws_handler(WStype_t type, uint8_t* payload, size_t len) {
@@ -66,7 +74,7 @@ static void ws_handler(WStype_t type, uint8_t* payload, size_t len) {
             Serial.println("[ws] connected");
             break;
         case WStype_TEXT: {
-            StaticJsonDocument<256> doc;
+            JsonDocument doc;
             if (deserializeJson(doc, payload, len)) return;
             const char* t = doc["type"] | "";
             Serial.printf("[ws] <- %s\n", t);
@@ -76,16 +84,16 @@ static void ws_handler(WStype_t type, uint8_t* payload, size_t len) {
                 state = DeviceState::SESSION_ACTIVE;
             else if (!strcmp(t, "session_ended"))
                 state = DeviceState::IDLE;
+            else if (!strcmp(t, "agent_interrupted"))
+                {} // P10: flush jitter buffer
             break;
         }
         case WStype_BIN:
-            // TTS Opus audio from server → decode → speaker
+            // TTS Opus from server → decode → speaker
             if (state == DeviceState::SESSION_ACTIVE) {
                 int16_t pcm[OPUS_FRAME_SAMPLES];
                 int samples = opus_decode_frame(payload, len, pcm);
-                if (samples > 0) {
-                    M5.Speaker.playRaw(pcm, samples, OPUS_SAMPLE_RATE, false);
-                }
+                if (samples > 0) M5.Speaker.playRaw(pcm, samples, OPUS_SAMPLE_RATE, false);
             }
             break;
         default: break;
@@ -97,7 +105,7 @@ static void ws_handler(WStype_t type, uint8_t* payload, size_t len) {
 // ---------------------------------------------------------------------------
 
 static bool wifi_connect(const char* ssid, const char* pass, unsigned long timeout_ms = 30000) {
-    Serial.printf("Wi-Fi: %s... ", ssid);
+    Serial.printf("WiFi: %s... ", ssid);
     WiFi.mode(WIFI_STA);
     WiFi.begin(ssid, pass);
     unsigned long start = millis();
@@ -110,6 +118,57 @@ static bool wifi_connect(const char* ssid, const char* pass, unsigned long timeo
 }
 
 // ---------------------------------------------------------------------------
+// Display
+// ---------------------------------------------------------------------------
+
+static void draw_ui() {
+    // Background color signals state
+    uint16_t bg;
+    const char* label;
+    switch (state) {
+        case DeviceState::SESSION_ACTIVE: bg = TFT_RED;    label = "TALKING";   break;
+        case DeviceState::WSS_CONNECT:    bg = TFT_BLUE;   label = "CONNECTING";break;
+        case DeviceState::WIFI_CONNECT:   bg = TFT_ORANGE; label = "WIFI...";   break;
+        default:                          bg = TFT_DARKGREEN; label = "GOTOWY"; break;
+    }
+
+    M5.Lcd.fillScreen(bg);
+
+    // Main label
+    M5.Lcd.setTextColor(TFT_WHITE, bg);
+    M5.Lcd.setTextSize(3);
+    M5.Lcd.setCursor(20, 30);
+    M5.Lcd.println(label);
+
+    // IP + RSSI
+    M5.Lcd.setTextSize(1);
+    M5.Lcd.setTextColor(TFT_WHITE, bg);
+    M5.Lcd.setCursor(20, 70);
+    if (WiFi.isConnected())
+        M5.Lcd.printf("IP: %s  %ddBm", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    else
+        M5.Lcd.print("WiFi: DOWN");
+
+    // Battery
+    M5.Lcd.setCursor(20, 85);
+    M5.Lcd.printf("Batt: %d%%  Heap: %dK", M5.Power.getBatteryLevel(), ESP.getFreeHeap() / 1024);
+
+    // PTT hint
+    if (state == DeviceState::IDLE) {
+        M5.Lcd.setTextSize(2);
+        M5.Lcd.setTextColor(TFT_WHITE, bg);
+        M5.Lcd.setCursor(20, 110);
+        M5.Lcd.println("Nacisnij i mow");
+    }
+
+    // Character
+    M5.Lcd.setTextSize(1);
+    M5.Lcd.setTextColor(TFT_CYAN, bg);
+    M5.Lcd.setCursor(20, 140);
+    M5.Lcd.println("Radek");
+}
+
+// ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
 
@@ -118,27 +177,31 @@ void setup() {
     delay(500);
     Serial.println("\ncores3 walkie-talkie boot");
 
-    // M5Unified BSP
-    // Audio (mic+speaker) deferred to P10 — M5.Mic/Speaker I2S callbacks
-    // overflow the default 8KB loopTask stack when combined with WS+WiFi.
     auto cfg = M5.config();
     cfg.serial_baudrate = 115200;
+    cfg.internal_mic = false;  // P10
+    cfg.internal_spk = false;
     M5.begin(cfg);
     Serial.printf("Board:%d Battery:%d%%\n", M5.getBoard(), M5.Power.getBatteryLevel());
 
-    // Opus codec
-    if (!opus_stub_init()) {
-        Serial.println("[opus] FAILED — audio disabled");
-    }
+    M5.Lcd.setRotation(1);
+    M5.Lcd.fillScreen(TFT_BLACK);
+    M5.Lcd.setTextColor(TFT_GREEN, TFT_BLACK);
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setCursor(20, 30);
+    M5.Lcd.println("Walkie-Talkie");
+    M5.Lcd.setTextSize(1);
+    M5.Lcd.setCursor(20, 55);
+    M5.Lcd.println("CoreS3 boot...");
 
-    // Wi-Fi
-    if (!wifi_connect(WIFI_SSID, WIFI_PASS)) {
-        Serial.println("Wi-Fi FAILED — retrying in loop");
-    } else {
+    if (!opus_stub_init())
+        Serial.println("[opus] FAILED");
+
+    if (!wifi_connect(WIFI_SSID, WIFI_PASS))
+        Serial.println("WiFi FAILED");
+    else
         state = DeviceState::WIFI_CONNECT;
-    }
 
-    // WebSocket
     ws.begin(BACKEND_HOST, BACKEND_PORT, "/ws/cores3?device_token=" DEVICE_TOKEN);
     ws.onEvent(ws_handler);
     ws.setReconnectInterval(5000);
@@ -151,38 +214,48 @@ void setup() {
 // ---------------------------------------------------------------------------
 
 void loop() {
-    static unsigned long last_beat = 0, last_keepalive = 0;
-    static bool demo_session_sent = false;
+    static unsigned long last_beat = 0, last_keepalive = 0, last_display = 0;
     unsigned long now = millis();
 
     if (!WiFi.isConnected()) wifi_connect(WIFI_SSID, WIFI_PASS);
     ws.loop();
 
-    // State transitions
     if (state == DeviceState::WIFI_CONNECT && WiFi.isConnected())
-        { state = DeviceState::WSS_CONNECT; Serial.println("state→WSS_CONNECT"); }
+        { state = DeviceState::WSS_CONNECT; }
 
     // Keepalive
     if ((state == DeviceState::IDLE || state == DeviceState::WSS_CONNECT) && now - last_keepalive >= 30000) {
         last_keepalive = now; send_keepalive();
     }
 
-    // Audio loop (P10): mic → Opus encode → WS send
-    // Deferred — requires FreeRTOS task pinning to avoid loopTask stack overflow.
-    // Current wiring compiles and links but M5.Mic.record + opus_encode + ws.sendBIN
-    // exceeds the default 8KB loopTask stack. See platformio.ini STACK_SIZE note.
+    // --- Touch PTT ---
+    M5.update();
+    auto touch = M5.Touch.getDetail();
 
-    // Demo: auto-start session after 8s, end after 25s (P13 replaces this with touch PTT)
-    if (state == DeviceState::IDLE && !demo_session_sent && now > 8000) {
-        demo_session_sent = true;
-        send_json("session_start");
-        Serial.println("state→SESSION_ACTIVE (demo)");
+    if (touch.wasPressed()) {
+        if (now - touch_down_at > TOUCH_DEBOUNCE_MS) {
+            touch_pressed = true;
+            touch_down_at = now;
+            if (state == DeviceState::IDLE) {
+                send_session_start();
+                Serial.println("→ SESSION_ACTIVE (PTT)");
+            }
+        }
     }
-    if (state == DeviceState::SESSION_ACTIVE && demo_session_sent && now > 25000) {
-        send_json("session_end");
-        state = DeviceState::IDLE;
-        demo_session_sent = false;
-        Serial.println("state→IDLE (demo end)");
+
+    if (touch.wasReleased() && touch_pressed) {
+        touch_pressed = false;
+        if (state == DeviceState::SESSION_ACTIVE) {
+            send_session_end();
+            state = DeviceState::IDLE;
+            Serial.println("→ IDLE (PTT release)");
+        }
+    }
+
+    // --- Display update ---
+    if (now - last_display >= 1000) {
+        last_display = now;
+        draw_ui();
     }
 
     // Heartbeat
@@ -193,6 +266,4 @@ void loop() {
                       WiFi.isConnected() ? WiFi.localIP().toString().c_str() : "DOWN",
                       WiFi.RSSI(), ESP.getFreeHeap(), ESP.getFreePsram(), (int)state);
     }
-
-    M5.update();
 }
