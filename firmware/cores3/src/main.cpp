@@ -32,6 +32,14 @@ static DeviceState state = DeviceState::BOOT;
 static bool touch_pressed = false;
 static unsigned long touch_down_at = 0;
 static const unsigned long TOUCH_DEBOUNCE_MS = 50;
+static unsigned long last_tap_at = 0;
+static int tap_count = 0;
+static const unsigned long DOUBLE_TAP_MS = 400;
+
+// Characters (matching server _CHARACTERS + _VALID_CHARACTERS)
+static const char* CHARACTERS[] = {"radek","steve","simba","ryder","creeper","pimpek","crewmate","sonic","pikachu","mario","roblox_noob"};
+static const int NUM_CHARS = 11;
+static int current_char_idx = 0;  // 0 = radek (default)
 
 // WebSocket
 static WebSocketsClient ws;
@@ -62,6 +70,14 @@ static void send_session_start() {
 static void send_session_end() {
     JsonDocument doc;
     doc["type"] = "session_end"; doc["ts"] = millis() / 1000;
+    String out; serializeJson(doc, out); ws.sendTXT(out);
+}
+
+static void send_switch_character(const char* character) {
+    JsonDocument doc;
+    doc["type"] = "switch_character";
+    doc["character"] = character;
+    doc["ts"] = millis() / 1000;
     String out; serializeJson(doc, out); ws.sendTXT(out);
 }
 
@@ -161,11 +177,14 @@ static void draw_ui() {
         M5.Lcd.println("Nacisnij i mow");
     }
 
-    // Character
-    M5.Lcd.setTextSize(1);
+    // Character name
+    M5.Lcd.setTextSize(2);
     M5.Lcd.setTextColor(TFT_CYAN, bg);
-    M5.Lcd.setCursor(20, 140);
-    M5.Lcd.println("Radek");
+    M5.Lcd.setCursor(20, 130);
+    M5.Lcd.println(CHARACTERS[current_char_idx]);
+    M5.Lcd.setTextSize(1);
+    M5.Lcd.setCursor(20, 155);
+    M5.Lcd.println("double-tap: zmien postac");
 }
 
 // ---------------------------------------------------------------------------
@@ -246,15 +265,28 @@ void loop() {
 
     if (touch.wasPressed()) {
         if (now - touch_down_at > TOUCH_DEBOUNCE_MS) {
-            touch_pressed = true;
             touch_down_at = now;
-            if (state == DeviceState::IDLE) {
-                // Switch to mic mode
-                M5.Speaker.end();
-                M5.Mic.begin();
-                send_session_start();
-                Serial.println("→ SESSION_ACTIVE (PTT)");
+            // Double-tap detection for character switching
+            if (now - last_tap_at < DOUBLE_TAP_MS) {
+                tap_count++;
+                if (tap_count >= 2 && state == DeviceState::IDLE) {
+                    current_char_idx = (current_char_idx + 1) % NUM_CHARS;
+                    send_switch_character(CHARACTERS[current_char_idx]);
+                    Serial.printf("→ character: %s\n", CHARACTERS[current_char_idx]);
+                    tap_count = 0;
+                }
+            } else {
+                tap_count = 1;
+                // Single tap + hold = PTT
+                touch_pressed = true;
+                if (state == DeviceState::IDLE) {
+                    M5.Speaker.end();
+                    M5.Mic.begin();
+                    send_session_start();
+                    Serial.println("→ SESSION_ACTIVE (PTT)");
+                }
             }
+            last_tap_at = now;
         }
     }
 
@@ -263,7 +295,6 @@ void loop() {
         if (state == DeviceState::SESSION_ACTIVE) {
             send_session_end();
             state = DeviceState::IDLE;
-            // Switch back to speaker mode
             M5.Mic.end();
             M5.Speaker.begin();
             Serial.println("→ IDLE (PTT release)");
