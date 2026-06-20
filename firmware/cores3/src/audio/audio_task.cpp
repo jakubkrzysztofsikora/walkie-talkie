@@ -31,12 +31,17 @@ struct PcmEvent {
     int16_t pcm[OPUS_FRAME_SAMPLES];
     size_t samples;
 };
-static constexpr UBaseType_t PCM_QUEUE_LEN = 16;
+static constexpr UBaseType_t PCM_QUEUE_LEN = 32;   // ~640ms TTS burst headroom
 
 static QueueHandle_t g_control_queue = nullptr;
 static QueueHandle_t g_pcm_queue = nullptr;
 static QueueHandle_t g_outbound_queue = nullptr;
 static TaskHandle_t g_audio_task_handle = nullptr;
+
+// Drop counters (queue-full). volatile: written on audio_task/loopTask, read on
+// loopTask for the heartbeat. 32-bit reads are atomic on ESP32-S3.
+static volatile uint32_t g_pcm_drops = 0;
+static volatile uint32_t g_outbound_drops = 0;
 
 // ---------------------------------------------------------------------------
 // Task
@@ -61,7 +66,13 @@ static void audio_task(void* /*pvParameters*/) {
             if (ctl.stop_output) audio_hal_stop_speaker();
             if (ctl.set_mic) {
                 if (ctl.mic_enabled) audio_hal_start_mic();
-                else { audio_hal_stop_mic(); mic_accum_count = 0; }
+                else {
+                    audio_hal_stop_mic();
+                    mic_accum_count = 0;
+                    // Flush any encoded frames stranded from this turn so they
+                    // can't be prepended to the next utterance as stale audio.
+                    xQueueReset(g_outbound_queue);
+                }
             }
         }
 
@@ -80,7 +91,7 @@ static void audio_task(void* /*pvParameters*/) {
                 int len = opus_encode_frame(mic_accum, pkt.data, sizeof(pkt.data));
                 if (len > 0) {
                     pkt.len = (size_t)len;
-                    xQueueSend(g_outbound_queue, &pkt, 0);
+                    if (xQueueSend(g_outbound_queue, &pkt, 0) != pdTRUE) g_outbound_drops++;
                 }
                 mic_accum_count = 0;
             }
@@ -126,8 +137,11 @@ void audio_task_play_pcm(const int16_t* pcm, size_t samples) {
     PcmEvent evt;
     evt.samples = (samples > OPUS_FRAME_SAMPLES) ? OPUS_FRAME_SAMPLES : samples;
     memcpy(evt.pcm, pcm, evt.samples * sizeof(int16_t));
-    xQueueSend(g_pcm_queue, &evt, 0);   // best-effort: a dropped TTS frame is a blip
+    if (xQueueSend(g_pcm_queue, &evt, 0) != pdTRUE) g_pcm_drops++;  // best-effort: dropped TTS frame is a blip
 }
+
+uint32_t audio_task_pcm_drops()      { return g_pcm_drops; }
+uint32_t audio_task_outbound_drops() { return g_outbound_drops; }
 
 bool audio_task_stop_output() {
     if (!g_control_queue) return false;
@@ -150,6 +164,7 @@ bool audio_task_get_outbound_packet(uint8_t* out, size_t* out_len, TickType_t wa
     if (!g_outbound_queue || !out || !out_len) return false;
     OutboundPacket pkt;
     if (xQueueReceive(g_outbound_queue, &pkt, wait) != pdTRUE) return false;
+    if (pkt.len > AUDIO_MAX_OPUS_PACKET) pkt.len = AUDIO_MAX_OPUS_PACKET;  // never trust queued len (caller's out[] is this size)
     memcpy(out, pkt.data, pkt.len);
     *out_len = pkt.len;
     return true;

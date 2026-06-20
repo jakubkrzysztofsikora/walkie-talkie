@@ -303,6 +303,13 @@ void loop() {
     if(state==WIFI_CONNECT&&WiFi.isConnected()) state=WSS_CONNECT;
     if((state==IDLE||state==WSS_CONNECT)&&now-last_keep>=30000){last_keep=now;send_keepalive();}
 
+    // Drain encoded mic packets → server. Only while actively talking; bounded so
+    // a backlog can't monopolise the loop. (Mic only produces frames in TALK.)
+    if(amode==AUDIO_TALK){
+        uint8_t pkt[AUDIO_MAX_OPUS_PACKET]; size_t plen; int budget=8;
+        while(budget-- && audio_task_get_outbound_packet(pkt,&plen,0)) ws.sendBIN(pkt,plen);
+    }
+
     // Touch
     auto touch = M5.Touch.getDetail();
     auto tp = M5.Touch.getTouchPointRaw(0);
@@ -326,6 +333,7 @@ void loop() {
 
     // Heartbeat
     if(now-last_beat>=10000){last_beat=now;
-        Serial.printf("[idle] uptime=%ds wifi=%s rssi=%d heap=%d psram=%d state=%d\n",(int)(now/1000),
-            WiFi.isConnected()?WiFi.localIP().toString().c_str():"DOWN",WiFi.RSSI(),ESP.getFreeHeap(),ESP.getFreePsram(),state);}
+        Serial.printf("[idle] uptime=%ds wifi=%s rssi=%d heap=%d psram=%d state=%d amode=%d pcm_drop=%u out_drop=%u\n",(int)(now/1000),
+            WiFi.isConnected()?WiFi.localIP().toString().c_str():"DOWN",WiFi.RSSI(),ESP.getFreeHeap(),ESP.getFreePsram(),state,amode,
+            (unsigned)audio_task_pcm_drops(),(unsigned)audio_task_outbound_drops());}
 }

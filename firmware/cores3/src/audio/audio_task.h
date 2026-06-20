@@ -13,8 +13,15 @@
 
 #include <Arduino.h>
 
-// Maximum encoded Opus packet size we ever produce (20 ms @ 48 kbps).
-static constexpr size_t AUDIO_MAX_OPUS_PACKET = 128;
+// Maximum encoded Opus packet size we ever produce. 20 ms @ 48 kbps averages
+// ~120 B but VBR bursts exceed 128, so 128 silently truncated quality. 256 has
+// ample headroom for any 20 ms VBR frame at this bitrate.
+static constexpr size_t AUDIO_MAX_OPUS_PACKET = 256;
+
+// Drop counters (queue-full events). Surfaced in the heartbeat so silent loss is
+// visible. Read-only for callers.
+uint32_t audio_task_pcm_drops();
+uint32_t audio_task_outbound_drops();
 
 // Initialize queues. Call once from setup().
 bool audio_task_init();
