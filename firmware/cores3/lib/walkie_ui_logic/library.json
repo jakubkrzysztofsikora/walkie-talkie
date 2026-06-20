@@ -1,0 +1,7 @@
+{
+  "name": "walkie_ui_logic",
+  "version": "1.0.0",
+  "description": "Core UI logic for the Walkie-Talkie mascot, sprites, animator and menu math",
+  "frameworks": "*",
+  "platforms": "*"
+}

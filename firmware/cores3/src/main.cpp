@@ -16,6 +16,14 @@
 #include "audio/audio_hal.h"
 #include "audio/audio_task.h"
 
+// Single source of truth for the character roster + themes (drops the old inline
+// CHARS[]/THEMES[]/NCHARS that drifted to 11 vs the lib's 12).
+#include "walkie_ui_logic/sprites.h"
+#include "walkie_ui_logic/animator.h"
+#ifdef UI_ENGINE
+#include "ui/ui_engine.h"
+#endif
+
 // Override default 8KB loopTask stack (UI + WS + Opus needs ~28KB)
 size_t getArduinoLoopTaskStackSize(void) { return 28672; }
 
@@ -53,17 +61,20 @@ static const unsigned long LONG_PRESS_MS = 1500;
 static bool menu_open = false;
 
 // --- Characters ---
-static const char* CHARS[] = {"radek","steve","simba","ryder","creeper","pimpek","crewmate","sonic","pikachu","mario","roblox_noob"};
-static const int NCHARS = 11;
+// Roster + themes now come from the walkie_ui lib (one source of truth). The
+// backend roster is 11 agents; the lib must agree or send_switch(idx) could read
+// an out-of-bounds id.
+static const int NCHARS = (int)walkie_ui::NCHARS;
+static_assert(walkie_ui::NCHARS == 11, "character roster must be 11 (backend agents)");
 static int char_idx = 0;
 
-// --- Theme ---
-struct Theme { uint16_t accent, bg; };
-static const Theme THEMES[] = {
-    {0x07FF,0x10E2},{0x07E0,0x0400},{0xFC60,0x3000},{0x981F,0x1806},
-    {0x07E0,0x0400},{0xFFE0,0x4200},{0xF800,0x4000},{0x07FF,0x0008},
-    {0xFFE0,0x4200},{0xF800,0x3800},{0xF81F,0x4008},
-};
+// Character id string for the switch_character message (replaces the old CHARS[]).
+static const char* char_id(int i) {
+    const walkie_ui::CharacterTheme* t = walkie_ui::get_character_theme((size_t)i);
+    return t ? t->id : "radek";
+}
+
+// --- Theme (runtime accent/bg pulled from the lib theme table) ---
 static uint16_t ui_accent = 0x07FF, ui_bg = 0x10E2;
 
 // --- WebSocket ---
@@ -214,11 +225,13 @@ static void draw_menu() {
     M5.Lcd.setTextSize(2);M5.Lcd.setTextColor(0xFFFF,ui_accent);
     M5.Lcd.setCursor(65,rh/2-12);M5.Lcd.print("PICK HERO");
     for(int i=0;i<NCHARS;i++){
+        const walkie_ui::CharacterTheme* th=walkie_ui::get_character_theme((size_t)i);
+        uint16_t acc=th?th->accent:0x07FF;
         int cx=(i%6)*cw+cw/2,cy=rh+(i/6)*rh+rh/2,r=(i==char_idx)?24:20;
         if(i==char_idx)M5.Lcd.fillCircle(cx,cy,r+2,0xFFFF);
-        M5.Lcd.fillCircle(cx,cy,r,THEMES[i].accent);
-        M5.Lcd.setTextSize(1);M5.Lcd.setTextColor(0xFFFF,THEMES[i].accent);
-        char nm[2]={(char)toupper(THEMES[i].accent>>8?CHARS[i][0]:CHARS[i][0]),0};
+        M5.Lcd.fillCircle(cx,cy,r,acc);
+        M5.Lcd.setTextSize(1);M5.Lcd.setTextColor(0xFFFF,acc);
+        char nm[2]={(char)toupper(char_id(i)[0]),0};
         M5.Lcd.setCursor(cx-4,cy-6);M5.Lcd.print(nm);
     }
 }
@@ -262,9 +275,77 @@ static void draw_ui() {
     static int lc = -1, lm = -1, lb = -1;
     if(millis()-anim_t>=150){anim_f=(anim_f+1)%32;anim_t=millis();if(anim_f==0)blink_s=(blink_s+1)%3;}
     bool sc=(state!=ls);ls=state;
-    if(char_idx!=lc){lc=char_idx;ui_accent=THEMES[char_idx%11].accent;ui_bg=THEMES[char_idx%11].bg;sc=true;}
+    if(char_idx!=lc){lc=char_idx;const walkie_ui::CharacterTheme* th=walkie_ui::get_character_theme((size_t)(char_idx%NCHARS));if(th){ui_accent=th->accent;ui_bg=th->background;}sc=true;}
     if(sc)draw_full();else draw_delta();
 }
+
+// ==================================================================
+// UI ENGINE (feature-flagged sprite renderer; inline draw_ui() is the
+// known-good fallback and stays until a later cutover commit)
+// ==================================================================
+#ifdef UI_ENGINE
+static walkie_ui::UIEngine g_ui;
+static bool g_ui_ok = false;
+
+// Enum-drift guards: the lib mirrors these enums by VALUE (the switches below map
+// by name, but other paths cast int<->enum). If anyone reorders either side these
+// fire at compile time. Keep in lockstep with animator.h's ScreenState/AudioMode.
+static_assert((int)BOOT           == (int)walkie_ui::ScreenState::BOOT,           "ScreenState BOOT drift");
+static_assert((int)WIFI_CONNECT   == (int)walkie_ui::ScreenState::WIFI_CONNECT,   "ScreenState WIFI_CONNECT drift");
+static_assert((int)WSS_CONNECT    == (int)walkie_ui::ScreenState::WSS_CONNECT,    "ScreenState WSS_CONNECT drift");
+static_assert((int)IDLE           == (int)walkie_ui::ScreenState::IDLE,           "ScreenState IDLE drift");
+static_assert((int)SESSION_ACTIVE == (int)walkie_ui::ScreenState::SESSION_ACTIVE, "ScreenState SESSION_ACTIVE drift");
+static_assert((int)AUDIO_IDLE     == (int)walkie_ui::AudioMode::AUDIO_IDLE,       "AudioMode AUDIO_IDLE drift");
+static_assert((int)AUDIO_TALK     == (int)walkie_ui::AudioMode::AUDIO_TALK,       "AudioMode AUDIO_TALK drift");
+static_assert((int)AUDIO_LISTEN   == (int)walkie_ui::AudioMode::AUDIO_LISTEN,     "AudioMode AUDIO_LISTEN drift");
+
+// Translate main.cpp's local enums into the lib's mirror enums.
+// NOTE: these switches intentionally have NO default case so adding a new
+// enumerator triggers a -Wswitch warning (catches drift the static_asserts above
+// can't — a new state with no mapping).
+static walkie_ui::ScreenState lib_screen(DeviceState s) {
+    switch (s) {
+        case BOOT:           return walkie_ui::ScreenState::BOOT;
+        case WIFI_CONNECT:   return walkie_ui::ScreenState::WIFI_CONNECT;
+        case WSS_CONNECT:    return walkie_ui::ScreenState::WSS_CONNECT;
+        case IDLE:           return walkie_ui::ScreenState::IDLE;
+        case SESSION_ACTIVE: return walkie_ui::ScreenState::SESSION_ACTIVE;
+    }
+    return walkie_ui::ScreenState::IDLE;
+}
+static walkie_ui::AudioMode lib_amode(AudioMode m) {
+    switch (m) {
+        case AUDIO_IDLE:   return walkie_ui::AudioMode::AUDIO_IDLE;
+        case AUDIO_TALK:   return walkie_ui::AudioMode::AUDIO_TALK;
+        case AUDIO_LISTEN: return walkie_ui::AudioMode::AUDIO_LISTEN;
+    }
+    return walkie_ui::AudioMode::AUDIO_IDLE;
+}
+
+// Push current device/audio state into the engine and render one frame.
+// noinline so ui_engine_frame stays a distinct symbol in firmware.elf (lets `nm`
+// confirm the UI_ENGINE path is linked, not inlined into loop()).
+static void __attribute__((noinline)) ui_engine_frame() {
+    if (!g_ui_ok) { draw_ui(); return; }   // PSRAM alloc failed → safe fallback
+    walkie_ui::ui_engine_set_state(g_ui, lib_screen(state));
+    walkie_ui::ui_engine_set_character(g_ui, (size_t)char_idx);
+    walkie_ui::ui_engine_set_menu_open(g_ui, menu_open);
+    walkie_ui::ui_engine_set_ptt(g_ui, touch_pressed);
+    // Feed a coarse speaking level so the waveform/mouth only animate when the
+    // agent is actually playing audio. This is an on/off proxy (mic-gate says
+    // LISTEN == TTS draining), NOT a true amplitude — good enough to stop the
+    // waveform free-running on mouth_frame during silence. A future improvement
+    // would derive a real level from playback-queue activity.
+    uint8_t level = (amode == AUDIO_LISTEN) ? 2 : 0;
+    walkie_ui::ui_engine_set_speaking_level(g_ui, level);
+    // Drive the expression from the pure decision function (keyed on amode so the
+    // agent-speaking face shows whenever TTS plays, including post-release IDLE).
+    walkie_ui::Expression expr =
+        walkie_ui::compute_screen(lib_amode(amode), lib_screen(state), touch_pressed, menu_open);
+    walkie_ui::ui_engine_set_expression(g_ui, expr);
+    walkie_ui::ui_engine_render(g_ui, M5.Power.getBatteryLevel(), WiFi.isConnected());
+}
+#endif
 
 // ==================================================================
 // SETUP
@@ -283,6 +364,15 @@ void setup() {
     // call M5.Speaker.begin()/M5.Mic.begin(). The raw audio_hal owns I2S0 and the
     // codec I2C bring-up; M5Unified's audio path would install I2S1 on the SAME
     // pins and fight us. (See plan Phase 2.)
+#ifdef UI_ENGINE
+    // Bring up the sprite engine once. The 150 KB back-buffer goes to PSRAM
+    // (setPsram inside ui_engine_init); log heap/psram around it so an OOM is
+    // visible. On failure g_ui_ok stays false and ui_engine_frame() falls back
+    // to the inline draw_ui().
+    Serial.printf("[ui] pre-init  heap=%d psram=%d\n", ESP.getFreeHeap(), ESP.getFreePsram());
+    g_ui_ok = walkie_ui::ui_engine_init(g_ui, &M5.Display);
+    Serial.printf("[ui] post-init heap=%d psram=%d ok=%d\n", ESP.getFreeHeap(), ESP.getFreePsram(), (int)g_ui_ok);
+#endif
     opus_stub_init();
     // Audio init must succeed before we connect; a "connected but silent" device
     // is worse than a visible failure. If the codec/I2S/task bring-up fails, mark
@@ -324,7 +414,20 @@ void loop() {
     auto tp = M5.Touch.getTouchPointRaw(0);
 
     if(menu_open){
-        if(touch.wasPressed()){int col=tp.x/53,row=tp.y/60,idx=row*6+col;if(idx>=0&&idx<NCHARS){char_idx=idx;send_switch(CHARS[idx]);} menu_open=false; touch_pressed=false;}
+        if(touch.wasPressed()){
+#ifdef UI_ENGINE
+            // Use the lib's TESTED hit-test, which matches the lib menu renderer's
+            // geometry (compute_menu_layout). The old tp.x/53 / tp.y/60 grid matched
+            // NEITHER renderer → wrong/unreachable selection. Only select on a hit;
+            // a miss still closes the menu (tap-outside-to-close).
+            size_t hit = walkie_ui::menu_hit_test((int16_t)tp.x, (int16_t)tp.y, g_ui.menu_layout);
+            if(hit < (size_t)NCHARS){ char_idx=(int)hit; send_switch(char_id((int)hit)); }
+#else
+            int col=tp.x/53,row=tp.y/60,idx=row*6+col;
+            if(idx>=0&&idx<NCHARS){char_idx=idx;send_switch(char_id(idx));}
+#endif
+            menu_open=false; touch_pressed=false;
+        }
     } else if(touch.wasPressed()&&state==IDLE&&!touch_pressed){
         touch_pressed=true;touch_down_at=now;send_session_start();
         Serial.println("→ SESSION_ACTIVE");
@@ -337,8 +440,18 @@ void loop() {
         touch_pressed=false;
     }
 
-    // Display
-    if(now-last_ui>=100){last_ui=now;draw_ui();}
+    // Display throttle: 10 Hz idle, but throttled to 5 Hz while SESSION_ACTIVE so
+    // the 150 KB sprite push / WS / Opus contend less for the loop during a live
+    // turn. This is a safe, build-verifiable change; the actual on-device benefit
+    // (out_drop staying 0 under load) MUST still be validated on hardware (soak).
+    const unsigned long ui_interval = (state==SESSION_ACTIVE) ? 200 : 100;
+    if(now-last_ui>=ui_interval){last_ui=now;
+#ifdef UI_ENGINE
+        ui_engine_frame();
+#else
+        draw_ui();
+#endif
+    }
 
     // Heartbeat
     if(now-last_beat>=10000){last_beat=now;
