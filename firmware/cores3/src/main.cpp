@@ -23,6 +23,28 @@ enum DeviceState { BOOT, WIFI_CONNECT, WSS_CONNECT, IDLE, SESSION_ACTIVE };
 static DeviceState state = BOOT;
 static bool g_audio_ok = false;   // false if codec/I2S/task bring-up failed (device silent)
 
+// --- Audio half-duplex mode (hard-gate: mic and speaker never active together) ---
+// Invariant: mic capture is enabled IFF mode==AUDIO_TALK. Inbound TTS forces
+// AUDIO_LISTEN (and disables the mic first), so a TTS frame arriving while the
+// PTT is still held can never leave the mic hot recording speaker echo.
+enum AudioMode { AUDIO_IDLE, AUDIO_TALK, AUDIO_LISTEN };
+static AudioMode amode = AUDIO_IDLE;
+
+static void audio_set_mode(AudioMode m) {
+    if (m == amode) return;
+    // Entering TALK: flush any residual TTS PCM BEFORE arming the mic so the
+    // speaker can't still be draining into an open mic.
+    if (m == AUDIO_TALK) audio_task_stop_output();
+    // Only commit the logical mode if the (non-starvable) control command was
+    // accepted. On a false return the mic state is unchanged, so leaving amode
+    // as-is keeps the gate honest rather than desyncing from the real mic.
+    if (audio_task_set_mic_enabled(m == AUDIO_TALK)) {
+        amode = m;
+    } else {
+        Serial.println("[audio] WARN mic gate command rejected — mode unchanged");
+    }
+}
+
 // --- Touch ---
 static bool touch_pressed = false;
 static unsigned long touch_down_at = 0;
@@ -46,10 +68,14 @@ static uint16_t ui_accent = 0x07FF, ui_bg = 0x10E2;
 // --- WebSocket ---
 static WebSocketsClient ws;
 
+static void send_session_end();   // fwd decl: ws_handler uses it (fast-tap race close)
+
 static void ws_handler(WStype_t type, uint8_t* payload, size_t len) {
     switch (type) {
         case WStype_DISCONNECTED:
             if (state == SESSION_ACTIVE) state = WSS_CONNECT;
+            touch_pressed = false;        // avoid stale held-state → spurious menu on reconnect
+            audio_set_mode(AUDIO_IDLE);   // never leave the mic hot on a drop
             break;
         case WStype_CONNECTED:
             Serial.println("[ws] connected"); break;
@@ -58,16 +84,31 @@ static void ws_handler(WStype_t type, uint8_t* payload, size_t len) {
             if (deserializeJson(doc, payload, len)) return;
             const char* t = doc["type"] | "";
             if (!strcmp(t, "hello") && state == WSS_CONNECT) state = IDLE;
-            else if (!strcmp(t, "session_started")) state = SESSION_ACTIVE;
-            else if (!strcmp(t, "session_ended")) state = IDLE;
+            else if (!strcmp(t, "session_started") && state != SESSION_ACTIVE) {
+                // Guard on !SESSION_ACTIVE: a duplicate/late session_started must
+                // not re-arm TALK while TTS from the current turn is still draining.
+                state = SESSION_ACTIVE;
+                // Only start capturing if the finger is still down. If the user
+                // already released before the server ack arrived (fast-tap race),
+                // close the session immediately instead of stranding it active.
+                if (touch_pressed) audio_set_mode(AUDIO_TALK);
+                else { send_session_end(); state = IDLE; audio_set_mode(AUDIO_IDLE); }
+            }
+            else if (!strcmp(t, "session_ended")) { state = IDLE; touch_pressed = false; audio_set_mode(AUDIO_IDLE); }
             break;
         }
         case WStype_BIN:
-            // TTS: decode Opus → queue for playback on the audio task (Core 1).
+            // TTS: decode Opus → queue for playback. Force LISTEN (mic off) before
+            // queuing ANY playback. Using != AUDIO_LISTEN (not == AUDIO_TALK) means
+            // even if a prior mic-off was somehow not in effect, we re-assert it
+            // here — the mic can never be hot when a TTS frame is queued.
             if (state == SESSION_ACTIVE) {
-                int16_t buf[OPUS_FRAME_SAMPLES];
-                int n = opus_decode_frame(payload, len, buf);
-                if (n > 0) audio_task_play_pcm(buf, n);
+                if (amode != AUDIO_LISTEN) audio_set_mode(AUDIO_LISTEN);
+                if (amode == AUDIO_LISTEN) {   // only play if the mic is confirmed off
+                    int16_t buf[OPUS_FRAME_SAMPLES];
+                    int n = opus_decode_frame(payload, len, buf);
+                    if (n > 0) audio_task_play_pcm(buf, n);
+                }
             }
             break;
         default: break;
@@ -276,7 +317,7 @@ void loop() {
     if(touch.wasReleased()&&touch_pressed){
         unsigned long held=now-touch_down_at;
         if(held>=LONG_PRESS_MS&&state==IDLE){menu_open=true;Serial.println("→ menu");}
-        else if(state==SESSION_ACTIVE){send_session_end();state=IDLE;Serial.println("→ IDLE");}
+        else if(state==SESSION_ACTIVE){audio_set_mode(AUDIO_IDLE);send_session_end();state=IDLE;Serial.println("→ IDLE");}
         touch_pressed=false;
     }
 

@@ -208,11 +208,30 @@ size_t audio_hal_read_mic(int16_t* buf, size_t samples) {
     }
 
     size_t frames_read = bytes_read / sizeof(int32_t);
+#ifdef MIC_DEBUG_SLOTS
+    // Build with -DMIC_DEBUG_SLOTS to confirm WHICH physical slot carries the mic.
+    // Logs per-slot RMS for the first ~50 frames after capture starts. If one slot
+    // is ~0 and the other has signal, switch from averaging to that slot.
+    static uint32_t dbg_frames = 0;
+    uint64_t sum_lo = 0, sum_hi = 0;
+#endif
     for (size_t i = 0; i < frames_read; ++i) {
         int16_t lo = (int16_t)(stereo_buf[i] & 0xFFFF);   // first/left slot
         int16_t hi = (int16_t)(stereo_buf[i] >> 16);      // second/right slot
         buf[i] = (int16_t)(((int32_t)lo + (int32_t)hi + 1) >> 1);  // average (vendor-equivalent)
+#ifdef MIC_DEBUG_SLOTS
+        sum_lo += (uint32_t)((int32_t)lo * lo);
+        sum_hi += (uint32_t)((int32_t)hi * hi);
+#endif
     }
+#ifdef MIC_DEBUG_SLOTS
+    if (frames_read && dbg_frames < 50) {
+        dbg_frames++;
+        Serial.printf("[mic] rms_lo=%lu rms_hi=%lu\n",
+                      (unsigned long)(sum_lo / frames_read),
+                      (unsigned long)(sum_hi / frames_read));
+    }
+#endif
     return frames_read;
 }
 
