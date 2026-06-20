@@ -238,7 +238,12 @@ void ui_engine_render(UIEngine& ui, int battery_pct, bool wifi_connected) {
         //  - NOT while overlay_suppressed (set by main.cpp during AUDIO_TALK), so
         //    the masked-run blit never steals time from the mic uplink during
         //    capture (protects out_drop).
-        if (ui.screen == ScreenState::SESSION_ACTIVE && !ui.overlay_suppressed) {
+        // Draw whenever an animation is loaded and we're NOT actively capturing
+        // (overlay_suppressed == AUDIO_TALK). The animation usually arrives while
+        // the user holds PTT and plays out AFTER they release (state -> IDLE),
+        // exactly like the TTS reply — so gating on SESSION_ACTIVE hid it. The
+        // pixel_anim_active() check inside bounds it to the play window.
+        if (!ui.overlay_suppressed) {
             pixel_anim_tick_and_draw(ui);
         }
     }
