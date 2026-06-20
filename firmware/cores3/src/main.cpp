@@ -84,7 +84,7 @@ static void ws_handler(WStype_t type, uint8_t* payload, size_t len) {
             JsonDocument doc;
             if (deserializeJson(doc, payload, len)) return;
             const char* t = doc["type"] | "";
-            if (!strcmp(t, "hello") && state == WSS_CONNECT) state = IDLE;
+            if (!strcmp(t, "hello") && (state == WIFI_CONNECT || state == WSS_CONNECT)) state = IDLE;
             else if (!strcmp(t, "session_started") && state != SESSION_ACTIVE) {
                 // Guard on !SESSION_ACTIVE: a duplicate/late session_started must
                 // not re-arm TALK while TTS from the current turn is still draining.
