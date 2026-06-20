@@ -1,5 +1,13 @@
 .pio/
 .vscode/
+.venv/
 compile_commands.json
 src/config/secrets.h
 .cores3.deploy.env
+
+# Sprite source-of-truth: the 64x64 RGBA PNGs in assets/sprites/ ARE the source
+# from which sprites.cpp is generated. They MUST be committed alongside
+# sprites.cpp for reproducible builds + a meaningful drift gate. Keep them
+# tracked even if a broader rule above ever starts matching PNGs.
+!assets/sprites/
+!assets/sprites/*.png

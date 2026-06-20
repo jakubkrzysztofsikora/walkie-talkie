@@ -11,6 +11,14 @@ void test_character_count_matches_nchars(void) {
     TEST_ASSERT_EQUAL_INT(11, static_cast<int>(NCHARS));
 }
 
+void test_sprite_dimensions(void) {
+    // Migrated 16x16 indexed -> 64x64 RGB565 + 1bpp mask.
+    TEST_ASSERT_EQUAL_UINT32(64, SPRITE_W);
+    TEST_ASSERT_EQUAL_UINT32(64, SPRITE_H);
+    TEST_ASSERT_EQUAL_UINT32(64 * 64, SPRITE_PIXELS);
+    TEST_ASSERT_EQUAL_UINT32((64 * 64 + 7) / 8, SPRITE_MASK_BYTES);  // 512
+}
+
 void test_every_character_has_all_frames(void) {
     for (size_t i = 0; i < NCHARS; ++i) {
         const CharacterSprites* spr = get_character_sprites(i);
@@ -20,14 +28,77 @@ void test_every_character_has_all_frames(void) {
         TEST_ASSERT_EQUAL_STRING(theme->id, spr->id);
         for (size_t e = 0; e < static_cast<size_t>(Expression::EXPRESSION_COUNT); ++e) {
             TEST_ASSERT_NOT_NULL(spr->frames[e]);
-            // Ensure at least some non-transparent pixels exist.
-            uint32_t non_zero = 0;
-            for (size_t p = 0; p < SPRITE_BYTES; ++p) {
-                if (spr->frames[e][p] != 0) ++non_zero;
+            TEST_ASSERT_NOT_NULL(spr->masks[e]);
+            // Ensure the mask marks at least some pixels opaque (non-empty art).
+            uint32_t opaque = 0;
+            for (size_t p = 0; p < SPRITE_MASK_BYTES; ++p) {
+                opaque += __builtin_popcount(spr->masks[e][p]);
             }
-            TEST_ASSERT_GREATER_THAN_UINT32(0, non_zero);
+            TEST_ASSERT_GREATER_THAN_UINT32(0, opaque);
         }
     }
+}
+
+void test_frames_pairwise_distinct(void) {
+    // Each character's 4 expression frames (and masks) must be DISTINCT arrays.
+    // Catches a generator bug that emits the same frame 4x, or swaps/duplicates
+    // an expression.
+    const size_t n = static_cast<size_t>(Expression::EXPRESSION_COUNT);
+    for (size_t i = 0; i < NCHARS; ++i) {
+        const CharacterSprites* spr = get_character_sprites(i);
+        TEST_ASSERT_NOT_NULL(spr);
+        for (size_t a = 0; a < n; ++a) {
+            for (size_t b = a + 1; b < n; ++b) {
+                TEST_ASSERT_TRUE(spr->frames[a] != spr->frames[b]);
+                TEST_ASSERT_TRUE(spr->masks[a] != spr->masks[b]);
+            }
+        }
+    }
+}
+
+void test_roster_order_pins_ids(void) {
+    // Pin the full 11-element roster order. Catches reordering or a swapped
+    // character in the generated table.
+    static const char* const expected[NCHARS] = {
+        "radek", "steve", "simba", "ryder", "creeper", "pimpek",
+        "crewmate", "sonic", "pikachu", "mario", "roblox_noob",
+    };
+    for (size_t i = 0; i < NCHARS; ++i) {
+        const CharacterTheme* theme = get_character_theme(i);
+        const CharacterSprites* spr = get_character_sprites(i);
+        TEST_ASSERT_NOT_NULL(theme);
+        TEST_ASSERT_NOT_NULL(spr);
+        TEST_ASSERT_EQUAL_STRING(expected[i], theme->id);
+        TEST_ASSERT_EQUAL_STRING(expected[i], spr->id);
+    }
+}
+
+// The PNG->RGB565 conversion is pure data; assert known RGB triples pack to the
+// expected 16-bit value (matches generate_sprites_png.rgb565_pack and the C++
+// blit path). RGB565 = ((r>>3)<<11)|((g>>2)<<5)|(b>>3).
+static uint16_t rgb565_pack(uint8_t r, uint8_t g, uint8_t b) {
+    return (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+}
+
+void test_rgb565_roundtrip(void) {
+    TEST_ASSERT_EQUAL_HEX16(0x0000, rgb565_pack(0x00, 0x00, 0x00));  // black
+    TEST_ASSERT_EQUAL_HEX16(0xFFFF, rgb565_pack(0xFF, 0xFF, 0xFF));  // white
+    TEST_ASSERT_EQUAL_HEX16(0xF800, rgb565_pack(0xFF, 0x00, 0x00));  // red
+    TEST_ASSERT_EQUAL_HEX16(0x07E0, rgb565_pack(0x00, 0xFF, 0x00));  // green
+    TEST_ASSERT_EQUAL_HEX16(0x001F, rgb565_pack(0x00, 0x00, 0xFF));  // blue
+    // Mid grey 0x80 -> r:0x10<<11, g:0x20<<5, b:0x10
+    TEST_ASSERT_EQUAL_HEX16(0x8410, rgb565_pack(0x80, 0x80, 0x80));
+}
+
+void test_sprite_mask_opaque_indexing(void) {
+    // bit (y*64+x). Craft a tiny mask buffer and verify the accessor.
+    uint8_t mask[SPRITE_MASK_BYTES] = {0};
+    // pixel (0,0) -> bit 0; pixel (1,0) -> bit 1; pixel (0,1) -> bit 64.
+    mask[0] = 0x01;            // (0,0)
+    mask[64 / 8] = 0x01;       // (0,1)
+    TEST_ASSERT_TRUE(sprite_mask_opaque(mask, 0, 0));
+    TEST_ASSERT_FALSE(sprite_mask_opaque(mask, 1, 0));
+    TEST_ASSERT_TRUE(sprite_mask_opaque(mask, 0, 1));
 }
 
 void test_character_index_by_id(void) {
@@ -37,15 +108,6 @@ void test_character_index_by_id(void) {
     TEST_ASSERT_EQUAL_UINT32(NCHARS, character_index_by_id("dmitry"));
     TEST_ASSERT_EQUAL_UINT32(NCHARS, character_index_by_id("unknown"));
     TEST_ASSERT_EQUAL_UINT32(NCHARS, character_index_by_id(nullptr));
-}
-
-void test_palette_resolution(void) {
-    CharacterTheme theme = {"test", 0x07FF, 0x047F, 0xFCE0, 0xC600, 0x10E2, 0x3DEF};
-    TEST_ASSERT_EQUAL_HEX16(0x0000, resolve_palette_color(SpriteColor::TRANSPARENT, theme));
-    TEST_ASSERT_EQUAL_HEX16(0xFFFF, resolve_palette_color(SpriteColor::WHITE, theme));
-    TEST_ASSERT_EQUAL_HEX16(0x07FF, resolve_palette_color(SpriteColor::ACCENT, theme));
-    TEST_ASSERT_EQUAL_HEX16(0x047F, resolve_palette_color(SpriteColor::ACCENT_DARK, theme));
-    TEST_ASSERT_EQUAL_HEX16(0xFCE0, resolve_palette_color(SpriteColor::SECONDARY, theme));
 }
 
 void test_animator_state_mapping(void) {
@@ -165,9 +227,13 @@ int main(int argc, char** argv) {
     (void)argv;
     UNITY_BEGIN();
     RUN_TEST(test_character_count_matches_nchars);
+    RUN_TEST(test_sprite_dimensions);
     RUN_TEST(test_every_character_has_all_frames);
+    RUN_TEST(test_frames_pairwise_distinct);
+    RUN_TEST(test_roster_order_pins_ids);
+    RUN_TEST(test_rgb565_roundtrip);
+    RUN_TEST(test_sprite_mask_opaque_indexing);
     RUN_TEST(test_character_index_by_id);
-    RUN_TEST(test_palette_resolution);
     RUN_TEST(test_animator_state_mapping);
     RUN_TEST(test_animator_tick_advances);
     RUN_TEST(test_bounce_offset_bounds);

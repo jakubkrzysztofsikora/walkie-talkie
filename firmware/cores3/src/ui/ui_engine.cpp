@@ -45,6 +45,15 @@ bool ui_engine_init(UIEngine& ui, M5GFX* display) {
     }
     Serial.printf("[ui] back-buffer in PSRAM ok (delta=%u)\n", (unsigned)psram_delta);
     ui.back_buffer_ok = true;
+    // The generated sprite arrays (sprites.cpp) are CPU-native little-endian
+    // RGB565. With the LGFX default _swapBytes=false, pushImage<uint16_t> would
+    // treat the buffer as byte-swapped and transpose every pixel's bytes,
+    // garbling all sprite colours. setSwapBytes(true) makes pushImage treat the
+    // arrays as nonswapped (CPU-native) RGB565 so they blit correctly. This only
+    // affects raw uint16 pushImage/pushPixels blits; chrome draws (fillRect,
+    // drawCircle, drawPixel, text) pass a uint16_t colour through
+    // _write_conv.convert() and are unaffected by this flag.
+    ui.back_buffer->setSwapBytes(true);
     ui.back_buffer->fillSprite(0x0000);
     ui.menu_layout = compute_menu_layout(320, 240);
     return true;
@@ -75,20 +84,41 @@ void ui_engine_set_expression(UIEngine& ui, Expression expr) {
     ui.use_forced_expression = true;
 }
 
-static void draw_sprite_scaled(lgfx::LGFX_Sprite* sprite, int16_t cx, int16_t cy,
-                               const uint8_t* data, const CharacterTheme& theme,
-                               uint8_t scale) {
-    const int16_t w = 16 * scale;
-    const int16_t h = 16 * scale;
-    const int16_t x0 = cx - w / 2;
-    const int16_t y0 = cy - h / 2;
+// Draw a 64x64 RGB565 sprite at native scale, centred on (cx,cy), honouring the
+// 1bpp alpha mask. Pushes contiguous opaque horizontal runs through the real
+// LovyanGFX pushImage(x,y,w,h,const T*) blit (LGFXBase.hpp:407) — far cheaper
+// than 4096 per-pixel fillRects, and the mask gives clean edges (no colour-key
+// fringing, no palette lookup).
+static void draw_sprite_native(lgfx::LGFX_Sprite* sprite, int16_t cx, int16_t cy,
+                               const uint16_t* data, const uint8_t* mask) {
+    const int16_t x0 = cx - SPRITE_W / 2;
+    const int16_t y0 = cy - SPRITE_H / 2;
+    for (size_t y = 0; y < SPRITE_H; ++y) {
+        const uint16_t* row = &data[y * SPRITE_W];
+        size_t x = 0;
+        while (x < SPRITE_W) {
+            if (!sprite_mask_opaque(mask, x, y)) { ++x; continue; }
+            const size_t run_start = x;
+            while (x < SPRITE_W && sprite_mask_opaque(mask, x, y)) ++x;
+            sprite->pushImage(x0 + (int16_t)run_start, y0 + (int16_t)y,
+                              (int16_t)(x - run_start), 1, &row[run_start]);
+        }
+    }
+}
 
-    for (uint8_t y = 0; y < 16; ++y) {
-        for (uint8_t x = 0; x < 16; ++x) {
-            uint8_t idx = data[y * 16 + x];
-            if (idx == 0) continue;  // transparent
-            uint16_t c = resolve_palette_color(static_cast<SpriteColor>(idx), theme);
-            sprite->fillRect(x0 + x * scale, y0 + y * scale, scale, scale, c);
+// Draw a 64x64 RGB565 sprite shrunk to a square `dst` px badge (nearest-
+// neighbour), honouring the alpha mask. Used for the menu hero badges.
+static void draw_sprite_badge(lgfx::LGFX_Sprite* sprite, int16_t cx, int16_t cy,
+                              const uint16_t* data, const uint8_t* mask,
+                              int16_t dst) {
+    const int16_t x0 = cx - dst / 2;
+    const int16_t y0 = cy - dst / 2;
+    for (int16_t dy = 0; dy < dst; ++dy) {
+        const size_t sy = (size_t)dy * SPRITE_H / dst;
+        for (int16_t dx = 0; dx < dst; ++dx) {
+            const size_t sx = (size_t)dx * SPRITE_W / dst;
+            if (!sprite_mask_opaque(mask, sx, sy)) continue;
+            sprite->drawPixel(x0 + dx, y0 + dy, data[sy * SPRITE_W + sx]);
         }
     }
 }
@@ -117,7 +147,9 @@ static void render_main_screen(UIEngine& ui, int battery_pct, bool wifi_connecte
     }
     const CharacterSprites* sprites = get_character_sprites(ui.character_idx);
     if (!sprites) return;  // theme is checked above; sprites must be too (null-deref guard)
-    const uint8_t* frame_data = sprites->frames[static_cast<size_t>(expr)];
+    const size_t expr_idx = static_cast<size_t>(expr);
+    const uint16_t* frame_data = sprites->frames[expr_idx];
+    const uint8_t* frame_mask = sprites->masks[expr_idx];
 
     int16_t mx = 160;
     int16_t my = 95 + bounce_offset(ui.animator);
@@ -130,7 +162,7 @@ static void render_main_screen(UIEngine& ui, int battery_pct, bool wifi_connecte
         ui.back_buffer->drawCircle(mx, my, 58, theme->glow);
     }
 
-    draw_sprite_scaled(ui.back_buffer, mx, my, frame_data, *theme, 4);
+    draw_sprite_native(ui.back_buffer, mx, my, frame_data, frame_mask);
 
     // Character carousel dots.
     int16_t cy = 175;
@@ -178,9 +210,10 @@ static void render_menu(UIEngine& ui) {
 
         const CharacterSprites* spr = get_character_sprites(i);
         if (!spr) continue;  // null-deref guard (mirrors the theme guard above)
-        draw_sprite_scaled(ui.back_buffer, x, y,
-                           spr->frames[static_cast<size_t>(Expression::IDLE)],
-                           *t, 2);
+        const size_t idle = static_cast<size_t>(Expression::IDLE);
+        draw_sprite_badge(ui.back_buffer, x, y,
+                          spr->frames[idle], spr->masks[idle],
+                          MENU_BADGE_RADIUS + 14);  // ~40px inside the 52px badge
     }
 }
 

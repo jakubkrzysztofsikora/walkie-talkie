@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 """
+DEPRECATED — superseded by scripts/generate_sprites_png.py.
+
+This generated the OLD 16x16 indexed-palette sprite model. The firmware now uses
+64x64 RGB565 + 1bpp alpha mask art generated from assets/sprites/*.png. Running
+this script would overwrite the new sprites.cpp with the obsolete format — do
+NOT run it. Kept only for reference / history.
+
 Generate C sprite data for the CoreS3 walkie-talkie UI.
 
 Each character has four 16x16 expression frames drawn as ASCII art below.
@@ -325,17 +332,14 @@ def get_themes() -> List[Tuple[str, int, int, int, int, int, int]]:
 
 
 def main() -> int:
-    script_dir = Path(__file__).resolve().parent
-    out = script_dir.parent / "lib" / "walkie_ui_logic" / "walkie_ui_logic" / "sprites.cpp"
-
-    frames: Dict[str, List[bytes]] = {}
-    for spec in CHARACTER_SPECS:
-        char_frames = build_character_frames(spec)
-        frames[spec["id"]] = [frame_to_bytes(f) for f in char_frames]
-
-    emit_cpp(THEMES, frames, out)
-    print(f"Generated {out}")
-    return 0
+    # HARD GATE: this deprecated generator emits the obsolete 16x16 indexed
+    # format to the SAME sprites.cpp path used by generate_sprites_png.py. Running
+    # it would clobber the current 64x64 RGB565 + 1bpp-mask sprites.cpp. Refuse
+    # to run BEFORE any file write so it can never destroy the live file.
+    sys.exit(
+        "DEPRECATED: use generate_sprites_png.py; this writes the obsolete 16x16 "
+        "indexed format and would clobber sprites.cpp. Refusing to run."
+    )
 
 
 if __name__ == "__main__":

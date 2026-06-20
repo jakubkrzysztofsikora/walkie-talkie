@@ -12,9 +12,11 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-# Import the sprite art definitions from the generator.
+# Import theme metadata + PNG asset locations from the RGB565 generator. The
+# sprite art itself is composited directly from assets/sprites/*.png now (64x64
+# RGBA), not from the old indexed-palette ASCII frames.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from generate_sprites import PALETTE, get_all_frames, get_themes
+from generate_sprites_png import get_themes, png_path, rgb565_pack, rgb565_to_rgb
 
 SCREEN_W, SCREEN_H = 320, 240
 
@@ -51,21 +53,45 @@ def resolve_color(idx: int, theme: tuple) -> tuple[int, int, int]:
     return (0, 0, 0)
 
 
+_SPRITE_CACHE: dict = {}
+
+
+def _device_quantize(img: Image.Image) -> Image.Image:
+    """Make the preview match the DEVICE pipeline: quantize each pixel through
+    RGB565 pack+unpack (so the preview shows the same banded/quantized colours
+    the panel renders) and binarize alpha to a hard 1-bit mask at the same
+    alpha>=128 threshold the generator uses. The device has no soft 8-bit alpha
+    — it's a 1bpp opacity mask — so soft edges in the source must become hard."""
+    img = img.convert("RGBA")
+    px = img.load()
+    out = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    opx = out.load()
+    for y in range(img.size[1]):
+        for x in range(img.size[0]):
+            r, g, b, a = px[x, y]
+            if a < 128:
+                continue  # 1bpp mask: pixel is transparent
+            qr, qg, qb = rgb565_to_rgb(rgb565_pack(r, g, b))
+            opx[x, y] = (qr, qg, qb, 255)
+    return out
+
+
+def _load_sprite(char_id: str, expr: str) -> Image.Image:
+    key = (char_id, expr)
+    if key not in _SPRITE_CACHE:
+        src = Image.open(png_path(char_id, expr))
+        _SPRITE_CACHE[key] = _device_quantize(src)
+    return _SPRITE_CACHE[key]
+
+
 def draw_sprite(img: Image.Image, draw: ImageDraw.ImageDraw,
-                cx: int, cy: int, frame: list[str], theme: tuple, scale: int) -> None:
-    w, h = 16 * scale, 16 * scale
-    x0, y0 = cx - w // 2, cy - h // 2
-    for y, row in enumerate(frame):
-        for x, ch in enumerate(row):
-            idx = PALETTE[ch]
-            color = resolve_color(idx, theme)
-            if color is None:
-                continue
-            draw.rectangle(
-                [x0 + x * scale, y0 + y * scale,
-                 x0 + (x + 1) * scale - 1, y0 + (y + 1) * scale - 1],
-                fill=color,
-            )
+                cx: int, cy: int, char_id: str, expr: str, dst: int) -> None:
+    """Composite a 64x64 RGBA sprite PNG (resized to dst px) using its alpha."""
+    spr = _load_sprite(char_id, expr)
+    if spr.size != (dst, dst):
+        spr = spr.resize((dst, dst), Image.NEAREST)
+    x0, y0 = cx - dst // 2, cy - dst // 2
+    img.alpha_composite(spr, (x0, y0))
 
 
 def draw_background(draw: ImageDraw.ImageDraw, theme: tuple, frame: int) -> None:
@@ -142,15 +168,13 @@ def draw_main_screen(char_idx: int, state: str, frame: int) -> Image.Image:
     themes = get_themes()
     char_id = themes[char_idx][0]
     theme = themes[char_idx]
-    frames = get_all_frames()[char_id]
 
-    img = Image.new("RGB", (SCREEN_W, SCREEN_H))
+    img = Image.new("RGBA", (SCREEN_W, SCREEN_H))
     draw = ImageDraw.Draw(img)
 
     draw_background(draw, theme, frame)
     draw_status_bar(draw, 75, True, theme)
 
-    expr_idx = {"idle": 0, "listen": 1, "think": 2, "speak": 3}[state]
     # Bounce offset
     tick = frame
     bounce_frame = tick % 12
@@ -165,7 +189,7 @@ def draw_main_screen(char_idx: int, state: str, frame: int) -> Image.Image:
 
     mx, my = 160, 95 + off
     draw.ellipse([mx - 58, my - 58, mx + 58, my + 58], outline=resolve_color(9, theme), width=2)
-    draw_sprite(img, draw, mx, my, frames[expr_idx], theme, 4)
+    draw_sprite(img, draw, mx, my, char_id, state, 64)
 
     # Carousel dots
     cy = 175
@@ -185,15 +209,14 @@ def draw_main_screen(char_idx: int, state: str, frame: int) -> Image.Image:
         draw_waveform(draw, mx, 203, frame, theme)
     draw_ptt(draw, mx, 215, state == "listen", theme)
 
-    return img
+    return img.convert("RGB")
 
 
 def draw_menu(char_idx: int) -> Image.Image:
     themes = get_themes()
     cur_theme = themes[char_idx]
-    frames = get_all_frames()
 
-    img = Image.new("RGB", (SCREEN_W, SCREEN_H))
+    img = Image.new("RGBA", (SCREEN_W, SCREEN_H))
     draw = ImageDraw.Draw(img)
     draw.rectangle([0, 0, SCREEN_W, SCREEN_H], fill=(0, 0, 0))
     banner = resolve_color(4, cur_theme)
@@ -213,9 +236,9 @@ def draw_menu(char_idx: int) -> Image.Image:
         if i == char_idx:
             draw.ellipse([x - r - 4, y - r - 4, x + r + 4, y + r + 4], fill=(255, 255, 255))
         draw.ellipse([x - r, y - r, x + r, y + r], fill=resolve_color(4, t))
-        draw_sprite(img, draw, x, y, frames[t[0]][0], t, 2)
+        draw_sprite(img, draw, x, y, t[0], "idle", 40)
 
-    return img
+    return img.convert("RGB")
 
 
 def main() -> int:
