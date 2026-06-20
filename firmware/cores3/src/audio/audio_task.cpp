@@ -59,7 +59,17 @@ static void audio_task(void* /*pvParameters*/) {
     size_t mic_accum_count = 0;
     OutboundPacket pkt;
 
+    Serial.printf("[audio] task running on core %d\n", (int)xPortGetCoreID());
+    TickType_t last_hw = 0;
+
     for (;;) {
+        // Stack high-water watch (~every 5s): if this drops near 0 the 16KB stack
+        // is too small. Logged so the soak can catch it before an overflow reboot.
+        if (xTaskGetTickCount() - last_hw > pdMS_TO_TICKS(5000)) {
+            last_hw = xTaskGetTickCount();
+            Serial.printf("[audio] stack_hwm=%u bytes\n",
+                          (unsigned)(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)));
+        }
         // 1) Drain CONTROL first — a mic-off here must take effect before any
         //    queued PCM is played, so the mic is never hot during playback.
         while (xQueueReceive(g_control_queue, &ctl, 0) == pdTRUE) {

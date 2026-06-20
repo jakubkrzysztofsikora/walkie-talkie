@@ -9,6 +9,7 @@
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include <esp_heap_caps.h>
+#include <esp_system.h>   // esp_reset_reason()
 
 #include "config/secrets.h"
 #include "audio/opus_stub.h"
@@ -267,6 +268,10 @@ static void draw_ui() {
 void setup() {
     Serial.begin(115200);delay(500);
     Serial.println("\ncores3 walkie-talkie boot");
+    // Reset reason: a brown-out (amp inrush) reports as rst:0x3 in the ROM string
+    // but esp_reset_reason() gives the true cause. Soak/stress watch this for
+    // ESP_RST_BROWNOUT(=9) / ESP_RST_TASK_WDT(=11) / ESP_RST_PANIC(=4).
+    Serial.printf("[boot] reset_reason=%d\n", (int)esp_reset_reason());
     auto cfg = M5.config();
     cfg.serial_baudrate=115200;cfg.internal_mic=true;cfg.internal_spk=true;
     M5.begin(cfg);
