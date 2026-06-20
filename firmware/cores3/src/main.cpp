@@ -23,6 +23,10 @@
 #ifdef UI_ENGINE
 #include "ui/ui_engine.h"
 #endif
+// PXA1 pixel-animation overlay (PSRAM storage + masked blit). pixel_anim_set /
+// pixel_anim_active compile in both builds; the blit is UI_ENGINE-only.
+#include "ui/pixel_anim.h"
+#include "walkie_ui_logic/pixel_anim.h"
 
 // Override default 8KB loopTask stack (UI + WS + Opus needs ~28KB)
 size_t getArduinoLoopTaskStackSize(void) { return 28672; }
@@ -110,6 +114,19 @@ static void ws_handler(WStype_t type, uint8_t* payload, size_t len) {
             break;
         }
         case WStype_BIN:
+            // A WStype_BIN message is EITHER a PXA1 pixel animation OR an Opus
+            // TTS frame. Disambiguate by the 4-byte magic FIRST: PXA1 payloads
+            // are >=8 bytes and start with "PXA1"; Opus frames are small and
+            // never do. On a match, store the animation (PSRAM copy) and stop —
+            // do NOT fall through to opus_decode (which would garble it).
+            // NOTE: a real Opus frame whose first 4 bytes happen to equal "PXA1"
+            // (chance ~2^-32) would be MISTAKEN for an animation and dropped here,
+            // never decoded. That's an acceptable one-in-four-billion audio glitch,
+            // not a crash — pixel_anim_set then rejects it as a malformed header.
+            if (walkie_ui::pxa_has_magic(payload, len)) {
+                pixel_anim_set(payload, len);   // validates internally; no-op if malformed
+                break;
+            }
             // TTS: decode Opus → queue for playback. Play whenever we are NOT
             // actively capturing (TALK). This lets the agent's reply — which the
             // backend streams AFTER the user releases PTT — and any connect-time
@@ -338,6 +355,9 @@ static void __attribute__((noinline)) ui_engine_frame() {
     // would derive a real level from playback-queue activity.
     uint8_t level = (amode == AUDIO_LISTEN) ? 2 : 0;
     walkie_ui::ui_engine_set_speaking_level(g_ui, level);
+    // Suppress the PXA1 overlay blit while the user is actively talking so the
+    // masked-run blit can't steal time from the mic uplink (protects out_drop).
+    walkie_ui::ui_engine_set_overlay_suppressed(g_ui, amode == AUDIO_TALK);
     // Drive the expression from the pure decision function (keyed on amode so the
     // agent-speaking face shows whenever TTS plays, including post-release IDLE).
     walkie_ui::Expression expr =

@@ -35,6 +35,12 @@ struct UIEngine {
 
     bool back_buffer_ok = false;  // false if PSRAM createSprite failed (fault flag)
 
+    // When true, the PXA1 pixel-animation overlay blit is suppressed for this
+    // frame even if an animation is active. main.cpp sets it while the user is
+    // actively talking (amode == AUDIO_TALK) to protect mic-uplink timing — the
+    // extra masked-run blit during capture risks out_drop. See ui_engine_render.
+    bool overlay_suppressed = false;
+
     AnimatorState animator;
     BackgroundState background;
     MenuLayout menu_layout;
@@ -47,10 +53,17 @@ void ui_engine_set_menu_open(UIEngine& ui, bool open);
 void ui_engine_set_ptt(UIEngine& ui, bool pressed);
 void ui_engine_set_speaking_level(UIEngine& ui, uint8_t level);
 
+// Suppress the PXA1 overlay blit for upcoming frames (set while AUDIO_TALK to
+// protect mic uplink timing). Cleared when capture stops.
+void ui_engine_set_overlay_suppressed(UIEngine& ui, bool suppressed);
+
 // Drive the mascot expression directly from the pure compute_screen() result.
 void ui_engine_set_expression(UIEngine& ui, Expression expr);
 
-// Call at ~10 Hz. Renders the full frame and pushes it to the display.
+// Call at ~10 Hz. Renders the full frame and pushes it to the display. If a
+// PXA1 pixel animation is active, it is composited as an overlay on top of the
+// mascot scene (into the back-buffer) BEFORE the final pushSprite, then
+// auto-dismisses back to the normal face when its duration elapses.
 void ui_engine_render(UIEngine& ui, int battery_pct, bool wifi_connected);
 
 } // namespace walkie_ui

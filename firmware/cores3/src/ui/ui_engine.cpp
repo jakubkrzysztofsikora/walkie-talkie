@@ -1,5 +1,6 @@
 #include "ui_engine.h"
 #include "controls.h"
+#include "pixel_anim.h"
 #include <cstring>
 
 namespace walkie_ui {
@@ -77,6 +78,10 @@ void ui_engine_set_ptt(UIEngine& ui, bool pressed) {
 
 void ui_engine_set_speaking_level(UIEngine& ui, uint8_t level) {
     ui.speaking_level = (level > 3) ? 3 : level;
+}
+
+void ui_engine_set_overlay_suppressed(UIEngine& ui, bool suppressed) {
+    ui.overlay_suppressed = suppressed;
 }
 
 void ui_engine_set_expression(UIEngine& ui, Expression expr) {
@@ -224,6 +229,18 @@ void ui_engine_render(UIEngine& ui, int battery_pct, bool wifi_connected) {
         render_menu(ui);
     } else {
         render_main_screen(ui, battery_pct, wifi_connected);
+        // Composite the PXA1 pixel animation (if active) ON TOP of the mascot
+        // scene, into the same back-buffer, BEFORE the push. Advances the frame
+        // on its own frame_ms cadence and auto-dismisses when it expires. Gated:
+        //  - only during an active conversation (SESSION_ACTIVE) — the overlay is
+        //    a session feature, not chrome for IDLE/connect screens; this also
+        //    bounds the extra blit cost to when it's intended.
+        //  - NOT while overlay_suppressed (set by main.cpp during AUDIO_TALK), so
+        //    the masked-run blit never steals time from the mic uplink during
+        //    capture (protects out_drop).
+        if (ui.screen == ScreenState::SESSION_ACTIVE && !ui.overlay_suppressed) {
+            pixel_anim_tick_and_draw(ui);
+        }
     }
 
     ui.back_buffer->pushSprite(0, 0);
