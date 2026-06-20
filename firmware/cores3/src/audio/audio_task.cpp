@@ -132,7 +132,9 @@ bool audio_task_start() {
     BaseType_t res = xTaskCreatePinnedToCore(
         audio_task,
         "audio_task",
-        16384,  // stack — Opus encode is stack-heavy + stereo_buf[320] on stack; 8192 was marginal
+        32768,  // stack — opus_encode (fixed-point CELT) is VERY deep; 16384 stack-
+                // canary-panicked on the first encode (confirmed on-device). 32KB
+                // gives headroom; watch [audio] stack_hwm to confirm.
         nullptr,
         2,     // priority higher than loopTask (1)
         &g_audio_task_handle,
