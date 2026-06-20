@@ -134,18 +134,16 @@ bool audio_hal_init() {
         return false;
     }
 
-    // Clock — Route A (legacy driver): explicit MCLK pin (set above) + fixed_mclk
-    // = 256*SR drives a clean master clock to the ES7210/AW88298. Stereo so each
-    // frame carries both slots (mic on one slot, speaker duplicated to both).
+    // Clock — Route A (legacy driver): the i2s_config above is the single source
+    // of truth for the clock. With use_apll=true + fixed_mclk=256*SR the APLL
+    // drives a continuous, accurate MCLK on GPIO0 (set in pin_config) regardless
+    // of TX activity, which the ES7210/AW88298 require. channel_format=
+    // RIGHT_LEFT already establishes stereo (mic on one slot, speaker duplicated
+    // to both), so a post-install i2s_set_clk() is NOT called — it is redundant
+    // and, in the legacy driver, can recompute and disturb the fixed MCLK.
     // If on-device mic audio is pitch-shifted or noisy, escalate to Route B:
     // port M5Unified's calcClockDiv (Mic_Class.cpp:442-447, div_m>=8) or migrate
     // the mic path to the new driver/i2s_std.h with i2s_std_clk_config_t.
-    err = i2s_set_clk(CORES3_I2S_PORT, OPUS_SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
-    if (err != ESP_OK) {
-        Serial.printf("[audio] i2s_set_clk failed: %d\n", err);
-        i2s_driver_uninstall(CORES3_I2S_PORT);
-        return false;
-    }
 
     // Codec bring-up — without these the amp stays muted and the ADC is silent.
     if (!aw88298_enable(OPUS_SAMPLE_RATE)) {
@@ -200,8 +198,10 @@ size_t audio_hal_read_mic(int16_t* buf, size_t samples) {
     size_t bytes_to_read = samples * sizeof(int32_t);
     int32_t stereo_buf[OPUS_FRAME_SAMPLES];
 
+    // Short timeout (~1 frame) so a quiet mic never stalls the audio task long
+    // enough to starve the PLAY_PCM drain or delay a SET_MIC_ENABLED(false) event.
     size_t bytes_read = 0;
-    esp_err_t err = i2s_read(CORES3_I2S_PORT, stereo_buf, bytes_to_read, &bytes_read, pdMS_TO_TICKS(50));
+    esp_err_t err = i2s_read(CORES3_I2S_PORT, stereo_buf, bytes_to_read, &bytes_read, pdMS_TO_TICKS(5));
     if (err != ESP_OK) {
         Serial.printf("[audio] i2s_read failed: %d\n", err);
         return 0;

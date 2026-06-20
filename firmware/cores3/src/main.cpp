@@ -12,6 +12,8 @@
 
 #include "config/secrets.h"
 #include "audio/opus_stub.h"
+#include "audio/audio_hal.h"
+#include "audio/audio_task.h"
 
 // Override default 8KB loopTask stack (UI + WS + Opus needs ~28KB)
 size_t getArduinoLoopTaskStackSize(void) { return 28672; }
@@ -19,6 +21,7 @@ size_t getArduinoLoopTaskStackSize(void) { return 28672; }
 // --- State ---
 enum DeviceState { BOOT, WIFI_CONNECT, WSS_CONNECT, IDLE, SESSION_ACTIVE };
 static DeviceState state = BOOT;
+static bool g_audio_ok = false;   // false if codec/I2S/task bring-up failed (device silent)
 
 // --- Touch ---
 static bool touch_pressed = false;
@@ -60,16 +63,11 @@ static void ws_handler(WStype_t type, uint8_t* payload, size_t len) {
             break;
         }
         case WStype_BIN:
-            // TTS: decode Opus → play via speaker. Stack buffer (no heap leak).
+            // TTS: decode Opus → queue for playback on the audio task (Core 1).
             if (state == SESSION_ACTIVE) {
-                static bool tts_playing = false;
-                static unsigned long tts_last = 0;
                 int16_t buf[OPUS_FRAME_SAMPLES];
                 int n = opus_decode_frame(payload, len, buf);
-                if (n > 0) {
-                    M5.Speaker.playRaw(buf, n, OPUS_SAMPLE_RATE, false, 1, 0, false);
-                    tts_playing = true; tts_last = millis();
-                }
+                if (n > 0) audio_task_play_pcm(buf, n);
             }
             break;
         default: break;
@@ -231,10 +229,17 @@ void setup() {
     auto cfg = M5.config();
     cfg.serial_baudrate=115200;cfg.internal_mic=true;cfg.internal_spk=true;
     M5.begin(cfg);
-    {auto spk=M5.Speaker.config();spk.sample_rate=OPUS_SAMPLE_RATE;spk.dma_buf_len=512;M5.Speaker.config(spk);}
-    {auto mic=M5.Mic.config();mic.sample_rate=OPUS_SAMPLE_RATE;mic.dma_buf_len=1024;M5.Mic.config(mic);}
-    M5.Speaker.begin();
+    // NOTE: keep cfg.internal_* (board detection + In_I2C bring-up) but do NOT
+    // call M5.Speaker.begin()/M5.Mic.begin(). The raw audio_hal owns I2S0 and the
+    // codec I2C bring-up; M5Unified's audio path would install I2S1 on the SAME
+    // pins and fight us. (See plan Phase 2.)
     opus_stub_init();
+    // Audio init must succeed before we connect; a "connected but silent" device
+    // is worse than a visible failure. If the codec/I2S/task bring-up fails, mark
+    // it so the UI can surface it (set via g_audio_ok; loop() shows a fault state).
+    g_audio_ok = audio_hal_init();
+    if (g_audio_ok) g_audio_ok = audio_task_init() && audio_task_start();
+    if (!g_audio_ok) Serial.println("[audio] AUDIO BRING-UP FAILED — device will be silent");
     wifi_connect(WIFI_SSID, WIFI_PASS);
     state = WIFI_CONNECT;
     ws.begin(BACKEND_HOST, BACKEND_PORT, "/ws/cores3?device_token=" DEVICE_TOKEN);
