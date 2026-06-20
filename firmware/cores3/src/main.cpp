@@ -99,13 +99,17 @@ static void ws_handler(WStype_t type, uint8_t* payload, size_t len) {
             break;
         }
         case WStype_BIN:
-            // TTS: decode Opus → queue for playback. Force LISTEN (mic off) before
-            // queuing ANY playback. Using != AUDIO_LISTEN (not == AUDIO_TALK) means
-            // even if a prior mic-off was somehow not in effect, we re-assert it
-            // here — the mic can never be hot when a TTS frame is queued.
-            if (state == SESSION_ACTIVE) {
+            // TTS: decode Opus → queue for playback. Play whenever we are NOT
+            // actively capturing (TALK). This lets the agent's reply — which the
+            // backend streams AFTER the user releases PTT — and any connect-time
+            // greeting actually play, instead of being dropped because the device
+            // already left SESSION_ACTIVE on release. The hard-gate is preserved:
+            // we force LISTEN (mic off) before queuing any audio, so the mic is
+            // never hot during playback. Only TALK (user holding PTT) suppresses
+            // playback, which is correct half-duplex behaviour.
+            if (amode != AUDIO_TALK && (state == IDLE || state == SESSION_ACTIVE)) {
                 if (amode != AUDIO_LISTEN) audio_set_mode(AUDIO_LISTEN);
-                if (amode == AUDIO_LISTEN) {   // only play if the mic is confirmed off
+                if (amode == AUDIO_LISTEN) {   // mic confirmed off before we play
                     int16_t buf[OPUS_FRAME_SAMPLES];
                     int n = opus_decode_frame(payload, len, buf);
                     if (n > 0) audio_task_play_pcm(buf, n);
