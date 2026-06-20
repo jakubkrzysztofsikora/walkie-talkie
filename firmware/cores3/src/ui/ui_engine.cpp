@@ -95,9 +95,14 @@ void ui_engine_set_expression(UIEngine& ui, Expression expr) {
 // than 4096 per-pixel fillRects, and the mask gives clean edges (no colour-key
 // fringing, no palette lookup).
 static void draw_sprite_native(lgfx::LGFX_Sprite* sprite, int16_t cx, int16_t cy,
-                               const uint16_t* data, const uint8_t* mask) {
-    const int16_t x0 = cx - SPRITE_W / 2;
-    const int16_t y0 = cy - SPRITE_H / 2;
+                               const uint16_t* data, const uint8_t* mask,
+                               uint8_t scale = 1) {
+    if (scale < 1) scale = 1;
+    const int16_t x0 = cx - (SPRITE_W * scale) / 2;
+    const int16_t y0 = cy - (SPRITE_H * scale) / 2;
+    // Expand each opaque run into a scaled row, then push it `scale` times tall.
+    static uint16_t srow[SPRITE_W * 4];   // max scale 4 (256px) — bounds the buffer
+    if (scale > 4) scale = 4;
     for (size_t y = 0; y < SPRITE_H; ++y) {
         const uint16_t* row = &data[y * SPRITE_W];
         size_t x = 0;
@@ -105,8 +110,19 @@ static void draw_sprite_native(lgfx::LGFX_Sprite* sprite, int16_t cx, int16_t cy
             if (!sprite_mask_opaque(mask, x, y)) { ++x; continue; }
             const size_t run_start = x;
             while (x < SPRITE_W && sprite_mask_opaque(mask, x, y)) ++x;
-            sprite->pushImage(x0 + (int16_t)run_start, y0 + (int16_t)y,
-                              (int16_t)(x - run_start), 1, &row[run_start]);
+            const size_t run_len = x - run_start;
+            if (scale == 1) {
+                sprite->pushImage(x0 + (int16_t)run_start, y0 + (int16_t)y,
+                                  (int16_t)run_len, 1, &row[run_start]);
+                continue;
+            }
+            size_t k = 0;
+            for (size_t i = 0; i < run_len; ++i)
+                for (uint8_t s = 0; s < scale; ++s) srow[k++] = row[run_start + i];
+            const int16_t dx = x0 + (int16_t)(run_start * scale);
+            const int16_t dy = y0 + (int16_t)(y * scale);
+            for (uint8_t s = 0; s < scale; ++s)
+                sprite->pushImage(dx, dy + s, (int16_t)k, 1, srow);
         }
     }
 }
@@ -149,6 +165,17 @@ static void render_main_screen(UIEngine& ui, int battery_pct, bool wifi_connecte
     Expression expr = animator_tick(ui.animator, desired, s_anim_cfg);
     if (ui.use_forced_expression) {
         expr = ui.forced_expression;
+        // Bring the forced state to LIFE rather than freezing one frame:
+        //  - SPEAK (agent talking): flap the mouth by alternating SPEAK<->LISTEN
+        //    every few ticks so it looks like it's actually talking.
+        //  - otherwise: every ~2.5s blink to a different expression briefly so
+        //    idle/listen don't sit dead-still.
+        const uint32_t tk = ui.animator.tick;
+        if (expr == Expression::SPEAK) {
+            expr = (tk % 4 < 2) ? Expression::SPEAK : Expression::LISTEN;
+        } else if ((tk % 25) < 2) {
+            expr = Expression::THINK;          // quick "alive" beat
+        }
     }
     const CharacterSprites* sprites = get_character_sprites(ui.character_idx);
     if (!sprites) return;  // theme is checked above; sprites must be too (null-deref guard)
@@ -159,15 +186,16 @@ static void render_main_screen(UIEngine& ui, int battery_pct, bool wifi_connecte
     int16_t mx = 160;
     int16_t my = 95 + bounce_offset(ui.animator);
 
-    // Glow ring when active.
+    // Glow ring when active (sized for the 2x = 128px mascot).
     if (ui.screen == ScreenState::SESSION_ACTIVE) {
-        ui.back_buffer->drawCircle(mx, my, 58, theme->glow);
-        ui.back_buffer->drawCircle(mx, my, 57, theme->glow);
+        ui.back_buffer->drawCircle(mx, my, 70, theme->glow);
+        ui.back_buffer->drawCircle(mx, my, 69, theme->glow);
     } else if (ui.screen == ScreenState::IDLE && (ui.animator.tick % 12) < 6) {
-        ui.back_buffer->drawCircle(mx, my, 58, theme->glow);
+        ui.back_buffer->drawCircle(mx, my, 70, theme->glow);
     }
 
-    draw_sprite_native(ui.back_buffer, mx, my, frame_data, frame_mask);
+    // 2x scale: 64x64 art -> 128x128 on screen (was tiny at native size).
+    draw_sprite_native(ui.back_buffer, mx, my, frame_data, frame_mask, /*scale=*/2);
 
     // Character carousel dots.
     int16_t cy = 175;
