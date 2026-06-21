@@ -3,6 +3,10 @@
 #include "pixel_anim.h"
 #include <cstring>
 
+// Extern: real-time mic peak from the audio task (0-255).
+// Used to drive the VU meter during PTT so the user sees their voice is heard.
+extern uint8_t audio_task_mic_peak();
+
 namespace walkie_ui {
 
 static AnimatorConfig s_anim_cfg = default_animator_config();
@@ -211,10 +215,21 @@ static void render_main_screen(UIEngine& ui, int battery_pct, bool wifi_connecte
     ui.back_buffer->fillTriangle(mx - 18, cy, mx - 10, cy - 4, mx - 10, cy + 4, 0x6B4D);
     ui.back_buffer->fillTriangle(mx + 18, cy, mx + 10, cy - 4, mx + 10, cy + 4, 0x6B4D);
 
-    // PTT / waveform at bottom.
+    // PTT / VU meter at bottom. When the user is actively talking (PTT held),
+    // show the real mic level so they can see their voice is heard. Otherwise
+    // render the standard PTT control with the agent-speaking ring.
     int16_t by = 215;
     if (ui.screen == ScreenState::SESSION_ACTIVE) {
-        draw_waveform(ui.back_buffer, mx, by - 12, ui.animator.mouth_frame, theme->accent);
+        uint8_t mic_peak = audio_task_mic_peak();
+        // 5-bar VU meter to the left of the PTT button.
+        int bars = (mic_peak * 5 + 127) / 255;
+        if (bars > 5) bars = 5;
+        for (int i = 0; i < 5; ++i) {
+            uint16_t col = (i < bars) ? theme->accent : 0x6B4D;
+            int16_t bx = 90 + i * 9;
+            int16_t bh = 6 + i * 4;
+            ui.back_buffer->fillRect(bx, by - bh - 2, 7, bh, col);
+        }
     }
     draw_ptt_control(ui.back_buffer, mx, by, ui.ptt_pressed, ui.speaking_level,
                      theme->accent, theme->background);

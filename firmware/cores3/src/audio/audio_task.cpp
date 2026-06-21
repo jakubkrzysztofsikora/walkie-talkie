@@ -43,6 +43,10 @@ static TaskHandle_t g_audio_task_handle = nullptr;
 static volatile uint32_t g_pcm_drops = 0;
 static volatile uint32_t g_outbound_drops = 0;
 
+// Mic peak level — updated per frame by the audio task, read by the UI loop.
+// Smoothed for a usable VU-meter decay (not instant — a raw sample peak flickers).
+static volatile uint8_t g_mic_peak = 0;
+
 // ---------------------------------------------------------------------------
 // Task
 // ---------------------------------------------------------------------------
@@ -98,6 +102,19 @@ static void audio_task(void* /*pvParameters*/) {
             size_t got = audio_hal_read_mic(&mic_accum[mic_accum_count], need);
             mic_accum_count += got;
             if (mic_accum_count >= OPUS_FRAME_SAMPLES) {
+                // Compute peak for the VU meter (0-255 range, log-ish mapping).
+                int32_t peak = 0;
+                for (size_t i = 0; i < OPUS_FRAME_SAMPLES; ++i) {
+                    int32_t absv = mic_accum[i] >= 0 ? mic_accum[i] : -mic_accum[i];
+                    if (absv > peak) peak = absv;
+                }
+                // Map 16-bit peak to 0-255 with soft decay: jump up instantly,
+                // decay by 24 units/frame (~480/s) so the bar fades smoothly.
+                uint8_t raw = (uint8_t)((peak * 255) / 28000);  // 28000 ≈ -1.3 dBFS headroom
+                if (raw > g_mic_peak) g_mic_peak = raw;
+                else if (g_mic_peak > 24) g_mic_peak -= 24;
+                else g_mic_peak = 0;
+
                 int len = opus_encode_frame(mic_accum, pkt.data, sizeof(pkt.data));
                 if (len > 0) {
                     pkt.len = (size_t)len;
@@ -180,4 +197,8 @@ bool audio_task_get_outbound_packet(uint8_t* out, size_t* out_len, TickType_t wa
     memcpy(out, pkt.data, pkt.len);
     *out_len = pkt.len;
     return true;
+}
+
+uint8_t audio_task_mic_peak() {
+    return g_mic_peak;
 }

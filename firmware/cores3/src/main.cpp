@@ -104,11 +104,11 @@ static void ws_handler(WStype_t type, uint8_t* payload, size_t len) {
                 // Guard on !SESSION_ACTIVE: a duplicate/late session_started must
                 // not re-arm TALK while TTS from the current turn is still draining.
                 state = SESSION_ACTIVE;
-                // Only start capturing if the finger is still down. If the user
-                // already released before the server ack arrived (fast-tap race),
-                // close the session immediately instead of stranding it active.
-                if (touch_pressed) audio_set_mode(AUDIO_TALK);
-                else { send_session_end(); state = IDLE; audio_set_mode(AUDIO_IDLE); }
+                // Mic was already started on PTT press. If the user already released,
+                // close the session immediately — the mic is already off at this point
+                // (release handler stops it), and the backend needs session_end to
+                // end-point the turn via trailing silence.
+                if (!touch_pressed) { send_session_end(); state = IDLE; }
             }
             else if (!strcmp(t, "session_ended")) { state = IDLE; touch_pressed = false; audio_set_mode(AUDIO_IDLE); }
             break;
@@ -140,7 +140,24 @@ static void ws_handler(WStype_t type, uint8_t* payload, size_t len) {
                 if (amode == AUDIO_LISTEN) {   // mic confirmed off before we play
                     int16_t buf[OPUS_FRAME_SAMPLES];
                     int n = opus_decode_frame(payload, len, buf);
-                    if (n > 0) audio_task_play_pcm(buf, n);
+                    if (n > 0) {
+                        audio_task_play_pcm(buf, n);
+                        // Debug: log first ~5 decoded TTS frames so we can confirm
+                        // they arrive, decode correctly, and reach the audio task.
+                        static uint32_t dbg_tts = 0;
+                        if (dbg_tts < 5) {
+                            int16_t peak = 0;
+                            for (int i = 0; i < n; ++i) {
+                                int16_t absv = buf[i] >= 0 ? buf[i] : (int16_t)-buf[i];
+                                if (absv > peak) peak = absv;
+                            }
+                            Serial.printf("[tts] frame #%u: len=%u decoded=%d peak=%d state=%d amode=%d pcm_drops=%u\n",
+                                          (unsigned)dbg_tts, (unsigned)len, n, (int)peak,
+                                          (int)state, (int)amode,
+                                          (unsigned)audio_task_pcm_drops());
+                            dbg_tts++;
+                        }
+                    }
                 }
             }
             break;
@@ -216,6 +233,18 @@ static void gear(int cx, int cy, int r, int f, uint16_t c) {
     M5.Lcd.drawCircle(cx,cy,r,c);
 }
 
+// Simple mic volume bar — 5 vertical bars that fill based on mic peak level.
+// Drawn to the left of the PTT mic icon so the user sees their voice is heard.
+static void draw_vu(int x, int y, uint8_t level, uint16_t c) {
+    // level 0-255 → bar count 0-5, with partial fill on the active bar
+    int bars = (level * 5 + 127) / 255;  // 0-5
+    if (bars > 5) bars = 5;
+    for (int i = 0; i < 5; ++i) {
+        uint16_t col = (i < bars) ? c : 0x6B4D;
+        M5.Lcd.fillRect(x + i * 8, y - i * 4 - 2, 6, 8 + i * 4, col);
+    }
+}
+
 static void draw_mascot() {
     uint16_t rc = ui_accent;
     // Glow ring
@@ -267,12 +296,13 @@ static void draw_full() {
     M5.Lcd.fillTriangle(MX-18,cy,MX-10,cy-4,MX-10,cy+4,0x6B4D);
     M5.Lcd.fillTriangle(MX+18,cy,MX+10,cy-4,MX+10,cy+4,0x6B4D);
     M5.Lcd.setTextSize(1);M5.Lcd.setTextColor(0x6B4D,ui_bg);M5.Lcd.setCursor(MX-35,170);M5.Lcd.print("hold 2s");
-    // Bottom
+    // Bottom — mic icon + volume indicator during PTT
     int by=215;
-    if(state==SESSION_ACTIVE)wave(MX,by-10,8,anim_f,ui_accent);
-    else if(state==WIFI_CONNECT||state==WSS_CONNECT)gear(MX,by-10,14,anim_f,ui_accent);
     int mx=154,my=by;
-    if(state==SESSION_ACTIVE){icon_mic(mx-4,my-8,0xF800);M5.Lcd.drawCircle(mx+2,my+2,22,0xF800);M5.Lcd.drawCircle(mx+2,my+2,21,0xF800);}
+    if(state==SESSION_ACTIVE){
+        draw_vu(90, by, audio_task_mic_peak(), ui_accent);
+        icon_mic(mx-4,my-8,0xF800);M5.Lcd.drawCircle(mx+2,my+2,22,0xF800);M5.Lcd.drawCircle(mx+2,my+2,21,0xF800);
+    }
     else if(state==IDLE){bool p=(anim_f%12<6);icon_mic(mx-4,my-8,p?ui_accent:0x6B4D);if(p)M5.Lcd.drawCircle(mx+2,my+2,22,ui_accent);}
     else icon_mic(mx-4,my-8,0x6B4D);
 }
@@ -280,8 +310,16 @@ static void draw_full() {
 static void draw_delta() {
     if(menu_open)return;
     int by=215;
-    if(state==SESSION_ACTIVE){M5.Lcd.fillRect(MX-45,by-24,90,20,ui_bg);wave(MX,by-10,8,anim_f,ui_accent);}
-    if(state==IDLE){M5.Lcd.fillCircle(MX,by+2,24,ui_bg);bool p=(anim_f%12<6);icon_mic(154-4,by-8,p?ui_accent:0x6B4D);if(p)M5.Lcd.drawCircle(156,by+2,22,ui_accent);}
+    if(state==SESSION_ACTIVE){
+        M5.Lcd.fillRect(85,by-22,70,24,ui_bg);  // clear VU meter area
+        M5.Lcd.fillRect(MX-45,by-24,90,20,ui_bg);  // clear old wave area
+        draw_vu(90, by, audio_task_mic_peak(), ui_accent);
+    }
+    if(state==IDLE){
+        M5.Lcd.fillRect(85,by-22,70,24,ui_bg);  // erase VU meter on state change
+        M5.Lcd.fillCircle(MX,by+2,24,ui_bg);
+        bool p=(anim_f%12<6);icon_mic(154-4,by-8,p?ui_accent:0x6B4D);if(p)M5.Lcd.drawCircle(156,by+2,22,ui_accent);
+    }
     M5.Lcd.fillRect(MX-16,MY-12,32,16,ui_bg);
     if(blink_s==2){M5.Lcd.drawFastHLine(MX-12,MY-6,10,ui_accent);M5.Lcd.drawFastHLine(MX+2,MY-6,10,ui_accent);}
     else{int pr=(state==SESSION_ACTIVE)?4:3;M5.Lcd.fillCircle(MX-10,MY-4,pr,ui_accent);M5.Lcd.fillCircle(MX+10,MY-4,pr,ui_accent);}
@@ -450,18 +488,22 @@ void loop() {
         }
     } else if(touch.wasPressed()&&state==IDLE&&!touch_pressed){
         touch_pressed=true;touch_down_at=now;send_session_start();
+        audio_set_mode(AUDIO_TALK);  // start capturing immediately — don't wait for session_started ack
         Serial.println("→ SESSION_ACTIVE");
     }
 
     // Controls: HOLD = talk, quick TAP (<400ms) = open character menu.
     if(touch.wasReleased()&&touch_pressed){
         unsigned long held=now-touch_down_at;
+        audio_set_mode(AUDIO_IDLE);  // stop capturing on release regardless of session state
         if(state==SESSION_ACTIVE){
-            audio_set_mode(AUDIO_IDLE);send_session_end();state=IDLE;Serial.println("→ IDLE");
+            send_session_end();state=IDLE;Serial.println("→ IDLE");
         } else if(held < 400){
             send_session_end(); menu_open=true; Serial.println("→ menu (tap)");
         } else {
-            send_session_end(); Serial.println("→ IDLE (hold, no session)");
+            // session_started hasn't arrived yet — send session_end anyway.
+            // The backend handles late session_end after session_started gracefully.
+            send_session_end(); Serial.println("→ IDLE (hold, waiting for ack)");
         }
         touch_pressed=false;
     }

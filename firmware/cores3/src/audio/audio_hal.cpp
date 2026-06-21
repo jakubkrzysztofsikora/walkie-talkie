@@ -5,6 +5,7 @@
 #include <driver/i2s.h>
 #include <driver/gpio.h>
 #include <freertos/FreeRTOS.h>
+#include <soc/i2s_reg.h>        // ESP32-S3 I2S hardware register definitions (&I2S1)
 
 // CoreS3 internal audio uses a single I2S port for speaker + mic.
 // Speaker and mic share MCLK/BCK/WS but have separate data pins.
@@ -14,16 +15,18 @@
 // AW88298 amp:  DOUT = GPIO 13
 // Internal mic: DIN  = GPIO 14
 //
-// NOTE on I2S port: this raw HAL owns I2S_NUM_0. M5Unified's own CoreS3 path
-// uses I2S_NUM_1 (M5Unified.cpp:2031/2220) on the SAME physical pins, so the
-// invariant is "exactly one runtime I2S driver on these pins" — never call
-// M5.Speaker.begin()/M5.Mic.begin() anywhere while this HAL is active.
+// NOTE on I2S port: M5Unified's own CoreS3 path uses I2S_NUM_1
+// (M5Unified.cpp:2031 mic, :2220 spk). We originally used I2S_NUM_0 to avoid
+// the risk of a stray M5.Speaker.begin() installing I2S1 on the same pins, but
+// I2S0 MCLK routing on ESP32-S3 may differ from I2S1 — and M5Unified's I2S1
+// path is the proven-working one. The invariant remains: never call
+// M5.Speaker.begin()/M5.Mic.begin() while this HAL is active.
 static constexpr gpio_num_t CORES3_I2S_MCK  = GPIO_NUM_0;
 static constexpr gpio_num_t CORES3_I2S_BCK  = GPIO_NUM_34;
 static constexpr gpio_num_t CORES3_I2S_WS   = GPIO_NUM_33;
 static constexpr gpio_num_t CORES3_I2S_DOUT = GPIO_NUM_13;
 static constexpr gpio_num_t CORES3_I2S_DIN  = GPIO_NUM_14;
-static constexpr i2s_port_t CORES3_I2S_PORT = I2S_NUM_0;
+static constexpr i2s_port_t CORES3_I2S_PORT = I2S_NUM_1;
 
 // Codec I2C addresses on the internal bus (M5.In_I2C). Mirror M5Unified.cpp:416-417.
 static constexpr uint8_t AW88298_ADDR = 0x36;  // speaker amp, 16-bit regs (byte-swapped!)
@@ -33,8 +36,9 @@ static constexpr uint8_t ES7210_ADDR  = 0x40;  // mic ADC, 8-bit regs
 // MCLK = 256 * sample_rate (4.096 MHz @ 16 kHz) — standard ratio for these codecs.
 static constexpr uint32_t CORES3_MCLK_HZ = OPUS_SAMPLE_RATE * 256;
 
-// 4 buffers * 320 samples = 1280 mono samples = 2560 bytes (~80 ms @ 16 kHz mono).
-static constexpr size_t I2S_DMA_BUF_COUNT = 4;
+// 8 buffers * 320 samples = 2560 mono samples = 5120 bytes (~160 ms @ 16 kHz mono).
+// Doubled from 4 to 8 to absorb scheduling jitter between i2s_write calls.
+static constexpr size_t I2S_DMA_BUF_COUNT = 8;
 static constexpr size_t I2S_DMA_BUF_LEN   = OPUS_FRAME_SAMPLES;
 
 static bool g_hal_initialized = false;
@@ -96,6 +100,8 @@ static bool es7210_enable() {
 bool audio_hal_init() {
     if (g_hal_initialized) return true;
 
+    // I2S config: full-duplex (TX+RX) so speaker and mic share BCK/WS/MCLK.
+    // PLL_240M clock (NOT APLL — use_apll is dead code on ESP32-S3).
     i2s_config_t i2s_config = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_RX),
         .sample_rate = OPUS_SAMPLE_RATE,
@@ -105,11 +111,8 @@ bool audio_hal_init() {
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
         .dma_buf_count = I2S_DMA_BUF_COUNT,
         .dma_buf_len = I2S_DMA_BUF_LEN,
-        .use_apll = true,                         // APLL required for fixed_mclk to take effect
-                                                  // (and gives an accurate audio clock for the ES7210)
+        .use_apll = false,
         .tx_desc_auto_clear = true,
-        .fixed_mclk = (int)CORES3_MCLK_HZ,        // 256 * SR clean master clock for ES7210/AW88298
-        .mclk_multiple = I2S_MCLK_MULTIPLE_256,
         .bits_per_chan = I2S_BITS_PER_CHAN_16BIT,
     };
 
@@ -134,22 +137,73 @@ bool audio_hal_init() {
         return false;
     }
 
-    // Clock — Route A (legacy driver): the i2s_config above is the single source
-    // of truth for the clock. With use_apll=true + fixed_mclk=256*SR the APLL
-    // drives a continuous, accurate MCLK on GPIO0 (set in pin_config) regardless
-    // of TX activity, which the ES7210/AW88298 require. channel_format=
-    // RIGHT_LEFT already establishes stereo (mic on one slot, speaker duplicated
-    // to both), so a post-install i2s_set_clk() is NOT called — it is redundant
-    // and, in the legacy driver, can recompute and disturb the fixed MCLK.
-    // If on-device mic audio is pitch-shifted or noisy, escalate to Route B:
-    // port M5Unified's calcClockDiv (Mic_Class.cpp:442-447, div_m>=8) or migrate
-    // the mic path to the new driver/i2s_std.h with i2s_std_clk_config_t.
+    // ESP32-S3 I2S hardware register patch — mirror M5Unified's spk_task
+    // (Speaker_Class.cpp:381-473). The i2s_driver_install above sets up the DMA
+    // engine but does NOT program the TX clock dividers, MCLK, BCK ratio, or
+    // commit the double-buffered configuration. Without these a freshly reset
+    // I2S peripheral runs at BCK=MCLK/1=4MHz (8× too fast) and the AW88298
+    // I2S receiver sees garbage bit boundaries → silence.
+    {
+        // Find the correct I2S dev pointer for our port.
+        volatile i2s_dev_t* dev = &I2S0;
+#if SOC_I2S_NUM >= 2
+        if (CORES3_I2S_PORT == I2S_NUM_1) dev = &I2S1;
+#endif
+        // TX: stay in stereo DMA mode. tx_mono=0, tx_chan_equal=0 (reset values).
+        // We pack the mono sample into both L+R slots manually in play_pcm.
+
+        // BCK divider: MCLK uses div_m=8 → BCK = MCLK/8 = 512 kHz.
+        // tx_bck_div_num = div_m - 1 = 7 (Speaker_Class.cpp:424).
+        uint32_t bits = 16;
+        uint32_t div_m = 8;
+        dev->tx_conf1.tx_bck_div_num = div_m - 1;
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+        dev->rx_conf1.rx_bck_div_num = div_m - 1;
+#endif
+
+        // Fractional clock divider — EXACT output of M5Unified's calcClockDiv
+        // for PLL_D2_CLK=120MHz, target=div_m*bits*sr=8*16*16000=2048000Hz.
+        // calcClockDiv searches a=[1..63] for minimum clock error and uses
+        // SMALL integers (max 63), not raw PLL remainders.
+        // Result: n=58, a=32, b=19 → yn1=1 → b'=13 → x=1, y=6, z=13.
+        dev->tx_clkm_div_conf.tx_clkm_div_x = 1;
+        dev->tx_clkm_div_conf.tx_clkm_div_y = 6;
+        dev->tx_clkm_div_conf.tx_clkm_div_z = 13;
+        dev->tx_clkm_div_conf.tx_clkm_div_yn1 = 1;
+        dev->tx_clkm_conf.tx_clkm_div_num = 58;
+        dev->tx_clkm_conf.tx_clk_sel = 1;   // PLL_240M_CLK
+        dev->tx_clkm_conf.clk_en = 1;
+        dev->tx_clkm_conf.tx_clk_active = 1;
+
+        // Commit TX clock config (double-buffered — CRITICAL).
+        // Without this toggle the ESP32-S3 I2S uses reset-state clock division.
+        dev->tx_conf.tx_update = 1;
+        dev->tx_conf.tx_update = 0;
+
+        Serial.printf("[audio] ESP32-S3 I2S HW patch OK: div_m=%u div_n=58\n",
+                      (unsigned)div_m);
+    }
 
     // Codec bring-up — without these the amp stays muted and the ADC is silent.
     if (!aw88298_enable(OPUS_SAMPLE_RATE)) {
         Serial.println("[audio] AW88298 codec init FAILED (I2C)");
         i2s_driver_uninstall(CORES3_I2S_PORT);
         return false;
+    }
+    // Read back AW88298 register 0x04 to verify the write took effect. On I2C
+    // failure the amp may ACK the write but not apply it — a silent amp with no
+    // other symptom. Also read 0x01 (SYSST) to check PLL lock status.
+    {
+        uint16_t reg04 = 0;
+        bool rd = M5.In_I2C.readRegister(AW88298_ADDR, 0x04, (uint8_t*)&reg04, 2, 400000);
+        reg04 = __builtin_bswap16(reg04);  // read also returns byte-swapped
+        Serial.printf("[audio] AW88298 reg04=%04X (I2SEN=%d AMPPD=%d PWDN=%d) read_ok=%d\n",
+                      reg04, (reg04>>6)&1, (reg04>>1)&1, reg04&1, (int)rd);
+        uint16_t reg01 = 0;
+        rd = M5.In_I2C.readRegister(AW88298_ADDR, 0x01, (uint8_t*)&reg01, 2, 400000);
+        reg01 = __builtin_bswap16(reg01);
+        Serial.printf("[audio] AW88298 reg01=%04X (PLLS=%d) read_ok=%d\n",
+                      reg01, reg01&1, (int)rd);
     }
     // ES7210 is configured ONCE here and left powered (configure-once design).
     // Deliberate trade-off: re-running the 29-register sequence on every PTT
@@ -239,17 +293,37 @@ bool audio_hal_play_pcm(const int16_t* pcm, size_t samples) {
     if (!g_hal_initialized || !pcm || samples == 0) return false;
     if (samples > OPUS_FRAME_SAMPLES) return false;  // guard: stereo_buf is fixed-size, never overflow
 
-    // Duplicate mono sample to both left and right slots for the AW88298.
-    int32_t stereo_buf[OPUS_FRAME_SAMPLES];
+    // Debug: log first few write calls with sample count + peak amplitude so we
+    // can confirm PCM data is non-silent when it reaches the I2S driver.
+    static uint32_t dbg_writes = 0;
+    if (dbg_writes < 10) {
+        int16_t peak = 0;
+        for (size_t i = 0; i < samples; ++i) {
+            int16_t absv = pcm[i] >= 0 ? pcm[i] : (int16_t)-pcm[i];
+            if (absv > peak) peak = absv;
+        }
+        Serial.printf("[audio] play_pcm #%u: %u samples peak=%d\n",
+                      (unsigned)dbg_writes, (unsigned)samples, (int)peak);
+        dbg_writes++;
+    }
+
+    // RIGHT_LEFT stereo: pack mono sample into both L+R 16-bit slots.
+    // Each 32-bit word = [L_hi L_lo R_hi R_lo] in little-endian memory,
+    // but the I2S peripheral reads as two 16-bit channel slots.
+    // Word 0 supplies right channel (bits 15:0), word 1 supplies left (bits 31:16).
+    // We pack SAME sample in both so amp reads correctly regardless of slot.
+    int32_t tx_buf[OPUS_FRAME_SAMPLES];
     for (size_t i = 0; i < samples; ++i) {
-        stereo_buf[i] = ((int32_t)pcm[i] << 16) | (uint16_t)pcm[i];
+        int16_t s = pcm[i];
+        tx_buf[i] = ((int32_t)s << 16) | (uint16_t)s;
     }
 
     size_t bytes_written = 0;
     size_t bytes_to_write = samples * sizeof(int32_t);
-    esp_err_t err = i2s_write(CORES3_I2S_PORT, stereo_buf, bytes_to_write, &bytes_written, pdMS_TO_TICKS(100));
+    esp_err_t err = i2s_write(CORES3_I2S_PORT, tx_buf, bytes_to_write, &bytes_written, pdMS_TO_TICKS(100));
     if (err != ESP_OK) {
-        Serial.printf("[audio] i2s_write failed: %d\n", err);
+        Serial.printf("[audio] i2s_write failed: %d port=%d bytes=%u/%u err=%d\n",
+                      CORES3_I2S_PORT, (unsigned)bytes_written, (unsigned)bytes_to_write, (int)err);
         return false;
     }
     return bytes_written == bytes_to_write;

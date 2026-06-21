@@ -43,3 +43,7 @@ bool audio_task_set_mic_enabled(bool enabled);
 // Drain one encoded outbound packet. Called from loopTask only.
 // Returns true if a packet was copied into `out`/`out_len`.
 bool audio_task_get_outbound_packet(uint8_t* out, size_t* out_len, TickType_t wait = 0);
+
+// Recent mic peak level (0-255), updated every 20ms frame when mic is active.
+// Smoothed with instant-attack + soft decay. Read from loopTask for VU meter.
+uint8_t audio_task_mic_peak();
