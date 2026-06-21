@@ -453,10 +453,16 @@ void loop() {
         Serial.println("→ SESSION_ACTIVE");
     }
 
+    // Controls: HOLD = talk, quick TAP (<400ms) = open character menu.
     if(touch.wasReleased()&&touch_pressed){
         unsigned long held=now-touch_down_at;
-        if(held>=LONG_PRESS_MS&&state==IDLE){menu_open=true;Serial.println("→ menu");}
-        else if(state==SESSION_ACTIVE){audio_set_mode(AUDIO_IDLE);send_session_end();state=IDLE;Serial.println("→ IDLE");}
+        if(state==SESSION_ACTIVE){
+            audio_set_mode(AUDIO_IDLE);send_session_end();state=IDLE;Serial.println("→ IDLE");
+        } else if(held < 400){
+            send_session_end(); menu_open=true; Serial.println("→ menu (tap)");
+        } else {
+            send_session_end(); Serial.println("→ IDLE (hold, no session)");
+        }
         touch_pressed=false;
     }
 

@@ -8,7 +8,7 @@ MenuLayout compute_menu_layout(int16_t screen_w, int16_t screen_h) {
     const int16_t rows = static_cast<int16_t>(MENU_ROWS);
     const int16_t cell_w = screen_w / cols;
     const int16_t cell_h = (screen_h - 40) / rows;  // leave top banner
-    const int16_t y0 = 80;
+    const int16_t y0 = 60;   // was 80 -> bottom row clipped off-screen
 
     for (size_t i = 0; i < NCHARS; ++i) {
         int16_t col = static_cast<int16_t>(i % MENU_COLS);

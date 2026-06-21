@@ -31,7 +31,7 @@ struct PcmEvent {
     int16_t pcm[OPUS_FRAME_SAMPLES];
     size_t samples;
 };
-static constexpr UBaseType_t PCM_QUEUE_LEN = 32;   // ~640ms TTS burst headroom
+static constexpr UBaseType_t PCM_QUEUE_LEN = 128;   // ~640ms TTS burst headroom
 
 static QueueHandle_t g_control_queue = nullptr;
 static QueueHandle_t g_pcm_queue = nullptr;
