@@ -1,7 +1,6 @@
 #include "audio_task.h"
 #include "audio_hal.h"
 #include "opus_stub.h"
-#include "opus_ring.h"
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
@@ -39,18 +38,10 @@ static QueueHandle_t g_pcm_queue = nullptr;
 static QueueHandle_t g_outbound_queue = nullptr;
 static TaskHandle_t g_audio_task_handle = nullptr;
 
-// Raw-Opus ring: loopTask pushes encoded TTS packets here (tiny memcpy); the
-// audio task pops + decodes + plays. This is the inbound playback hot path that
-// replaces the old loopTask-decodes-then-PCM-queue split (which starved under
-// loopTask contention → garbled speech). SPSC: loopTask produces, audio task
-// consumes.
-static OpusRing g_opus_ring;
-
 // Drop counters (queue-full). volatile: written on audio_task/loopTask, read on
 // loopTask for the heartbeat. 32-bit reads are atomic on ESP32-S3.
 static volatile uint32_t g_pcm_drops = 0;
 static volatile uint32_t g_outbound_drops = 0;
-static volatile uint32_t g_opus_drops = 0;
 
 // Mic peak level — updated per frame by the audio task, read by the UI loop.
 // Smoothed for a usable VU-meter decay (not instant — a raw sample peak flickers).
@@ -99,21 +90,7 @@ static void audio_task(void* /*pvParameters*/) {
             }
         }
 
-        // 2) Inbound TTS: pop raw Opus from the ring, decode HERE (off loopTask),
-        //    and play. This is the primary playback path. Decoding sequentially
-        //    in this one task keeps the decoder fed consecutive frames (no state
-        //    corruption) and keeps the heavy fixed-point decode off loopTask.
-        {
-            uint8_t opkt[OPUS_RING_MAX_PACKET];
-            size_t  oplen = 0;
-            while (opus_ring_pop(&g_opus_ring, opkt, &oplen)) {
-                int16_t pcm[OPUS_FRAME_SAMPLES];
-                int n = opus_decode_frame(opkt, oplen, pcm);
-                if (n > 0) audio_hal_play_pcm(pcm, (size_t)n);
-            }
-        }
-
-        // 2b) Legacy already-decoded PCM path (kept for compatibility / tests).
+        // 2) Then PCM playback (best-effort).
         while (xQueueReceive(g_pcm_queue, &pevt, 0) == pdTRUE) {
             audio_hal_play_pcm(pevt.pcm, pevt.samples);
         }
@@ -158,31 +135,12 @@ static void audio_task(void* /*pvParameters*/) {
 bool audio_task_init() {
     if (g_control_queue) return true;
 
-    opus_ring_init(&g_opus_ring);
-
     g_control_queue  = xQueueCreate(CONTROL_QUEUE_LEN, sizeof(ControlEvent));
     g_pcm_queue      = xQueueCreate(PCM_QUEUE_LEN, sizeof(PcmEvent));
     g_outbound_queue = xQueueCreate(PCM_QUEUE_LEN, sizeof(OutboundPacket));
 
     return g_control_queue && g_pcm_queue && g_outbound_queue;
 }
-
-// Producer (loopTask): copy the raw Opus packet into the ring. No decode here —
-// that's the whole point. opus_ring_push never blocks; on overflow it evicts the
-// oldest packet, which we count as a drop for the heartbeat.
-bool audio_task_push_opus(const uint8_t* data, size_t len) {
-    if (!data || len == 0) return false;
-    size_t before = opus_ring_count(&g_opus_ring);
-    bool ok = opus_ring_push(&g_opus_ring, data, len);
-    // If the ring was already full, push evicted the oldest → count a drop.
-    if (ok && opus_ring_count(&g_opus_ring) == before &&
-        before == OPUS_RING_CAPACITY) {
-        g_opus_drops++;
-    }
-    return ok;
-}
-
-uint32_t audio_task_opus_drops() { return g_opus_drops; }
 
 bool audio_task_start() {
     if (g_audio_task_handle) return true;

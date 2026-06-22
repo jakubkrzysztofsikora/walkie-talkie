@@ -29,19 +29,8 @@ bool audio_task_init();
 // Start the audio task pinned to Core 1.
 bool audio_task_start();
 
-// Queue a decoded PCM frame for playback. (Legacy path — prefer push_opus.)
+// Queue a decoded PCM frame for playback.
 void audio_task_play_pcm(const int16_t* pcm, size_t samples);
-
-// Hand a RAW (still-encoded) Opus TTS packet to the audio task. loopTask only
-// does a small memcpy into a lock-free ring; the audio task pops, Opus-decodes,
-// and plays. This keeps the ~30ms/frame fixed-point decode OFF the contended
-// loopTask, which was starving the playback path and corrupting decoder state
-// (the "sped-up / garbled" speech). Returns true if the packet was accepted.
-bool audio_task_push_opus(const uint8_t* data, size_t len);
-
-// Count of raw-Opus packets dropped because the ring overflowed (loopTask still
-// outran the audio task). Surfaced in the heartbeat. Should stay ~0.
-uint32_t audio_task_opus_drops();
 
 // Truncate any queued/pending TTS audio. Returns true if the command was queued.
 bool audio_task_stop_output();
