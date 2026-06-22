@@ -138,26 +138,11 @@ static void ws_handler(WStype_t type, uint8_t* payload, size_t len) {
             if (amode != AUDIO_TALK && (state == IDLE || state == SESSION_ACTIVE)) {
                 if (amode != AUDIO_LISTEN) audio_set_mode(AUDIO_LISTEN);
                 if (amode == AUDIO_LISTEN) {   // mic confirmed off before we play
-                    int16_t buf[OPUS_FRAME_SAMPLES];
-                    int n = opus_decode_frame(payload, len, buf);
-                    if (n > 0) {
-                        audio_task_play_pcm(buf, n);
-                        // Debug: log first ~5 decoded TTS frames so we can confirm
-                        // they arrive, decode correctly, and reach the audio task.
-                        static uint32_t dbg_tts = 0;
-                        if (dbg_tts < 5) {
-                            int16_t peak = 0;
-                            for (int i = 0; i < n; ++i) {
-                                int16_t absv = buf[i] >= 0 ? buf[i] : (int16_t)-buf[i];
-                                if (absv > peak) peak = absv;
-                            }
-                            Serial.printf("[tts] frame #%u: len=%u decoded=%d peak=%d state=%d amode=%d pcm_drops=%u\n",
-                                          (unsigned)dbg_tts, (unsigned)len, n, (int)peak,
-                                          (int)state, (int)amode,
-                                          (unsigned)audio_task_pcm_drops());
-                            dbg_tts++;
-                        }
-                    }
+                    // Hand the RAW Opus packet to the audio task — it decodes and
+                    // plays on Core 1. loopTask does NOT decode here: the
+                    // fixed-point Opus decode (~30ms/frame) on this contended
+                    // priority-1 task was starving playback and garbling speech.
+                    audio_task_push_opus(payload, len);
                 }
             }
             break;
@@ -523,7 +508,7 @@ void loop() {
 
     // Heartbeat
     if(now-last_beat>=10000){last_beat=now;
-        Serial.printf("[idle] uptime=%ds wifi=%s rssi=%d heap=%d psram=%d state=%d amode=%d pcm_drop=%u out_drop=%u\n",(int)(now/1000),
+        Serial.printf("[idle] uptime=%ds wifi=%s rssi=%d heap=%d psram=%d state=%d amode=%d pcm_drop=%u out_drop=%u opus_drop=%u\n",(int)(now/1000),
             WiFi.isConnected()?WiFi.localIP().toString().c_str():"DOWN",WiFi.RSSI(),ESP.getFreeHeap(),ESP.getFreePsram(),state,amode,
-            (unsigned)audio_task_pcm_drops(),(unsigned)audio_task_outbound_drops());}
+            (unsigned)audio_task_pcm_drops(),(unsigned)audio_task_outbound_drops(),(unsigned)audio_task_opus_drops());}
 }
