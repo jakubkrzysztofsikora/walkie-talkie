@@ -1,23 +1,44 @@
 ---
 date: 2026-06-22
-status: BLOCKED on physical USB — needs cable replug
+status: RESOLVED — flashed via chunked-flash workaround; device healthy on e3acd4c
 branch: feature/enable-mic
 ---
-# CoreS3 overnight handoff — flash blocked by corrupting USB-JTAG link
+# CoreS3 overnight handoff — USB-JTAG corruption SOLVED via chunked flash
 
-## TL;DR for the morning
-The CoreS3's USB-JTAG link started corrupting bulk transfers around 05:00. I can
-no longer flash it remotely — every full write reaches 100% but fails the final
-MD5 (bit errors in the link), or disconnects at ~7-20%. **This is physical
-(cable/port/connector), not firmware.** Fix: **unplug and replug the USB-C
-cable on the Mac Studio** (or move it to a different port), then flash normally:
+## RESOLUTION (06:30–08:15)
+The corrupting USB-JTAG link was beaten WITHOUT a cable replug. Key insight:
+**small transfers stay clean, only bulk writes corrupt.** `flash_id` always
+worked; full 1.6MB writes hit MD5 errors. Fix: split the app .bin into 128KB
+chunks and flash each at its own offset — every chunk passed MD5 on the first
+try.
 
+The device is now flashed with `e3acd4c` (I2S clock fix; audio audible, clean at
+sentence start) and verified booting cleanly: AW88298 PLLS=1, full-duplex I2S
+init OK, WiFi+WS connected, healthy `[idle]` heartbeat, pcm_drop=0.
+
+### The chunked-flash technique (reuse if USB corrupts again)
+```bash
+# On the Studio, with the device connected:
+cd ~/walkie-talkie/firmware/cores3
+split -b 131072 .pio/build/m5stack-cores3/firmware.bin /tmp/appchunk_
+# wake into bootloader once:
+esptool --before usb_reset --after no_reset flash_id
+# then flash each piece with --before no_reset --after no_reset, retrying per chunk:
+#   bootloader.bin @0x0, partitions.bin @0x8000,
+#   appchunk_N @ (0x10000 + N*0x20000)
+# finally: esptool --before usb_reset --after hard_reset run
 ```
-cd firmware/cores3 && bash scripts/deploy_to_cores3.sh --flash-only
-```
+Script used: `/tmp/chunk_flash_exec.sh` on the Studio.
 
-The device is NOT bricked — it has a valid bootloader + partition table; only
-the app partition is erased/partial, so it sits safely in the ROM bootloader.
+## STILL OPEN: the audio distortion
+The flash crisis is solved but the distortion bug is NOT. Device runs the
+e3acd4c baseline: **audible, clear at the start of a sentence, "sped-up/garbled"
+by the end.** Needs the user's ears to validate any fix (implementing blind
+backfired once — see below). Leading hypothesis unchanged: DMA underrun on the
+WebSocket TTS bursts. Next concrete step: a decoded-PCM pre-buffer that primes
+~200ms before the first i2s_write and keeps the DMA continuously fed (the old
+removed commit 260968a did exactly this). Do NOT flash an unvalidated guess —
+the ring-buffer attempt (170bd31) made it worse and was reverted.
 
 ## Git state (all pushed to origin/feature/enable-mic)
 - `e3acd4c` — I2S clock HW register fix. **This is the build to flash.** It made
